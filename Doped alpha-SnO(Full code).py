@@ -1,20 +1,17 @@
 """Doped alpha-SnO: literature-informed screening and Pareto analysis.
-
-GOOGLE COLAB: paste this entire file into ONE code cell and run it.
-Use a fresh CPU runtime. Your supplied Materials Project API key is configured below.
 Nominal screening substitutions: 1, 2, 3, 5, 10, 15 and 20% of the designated host sublattice.
 
 Five candidate dopants: Li, Na, K, N and P. No preferred dopant is hardcoded.
 This is a screening workflow, NOT a charged-defect DFT or Hall simulator.
 ML learns MP compound formation energies (eV/atom), not defect energies (eV/defect).
-Literature activation energies are INPUTS, not successful model predictions.
+Literature activation energies are INPUTS.
 No experimental results are fabricated or used to force Na to rank first.
 
 Gradient Boosting is the only trained ML model. Execution downloads MP data,
 performs grouped/nested hyperparameter tuning,
 held-out testing, leave-one-element-out transfer tests, group bootstrapping,
 transport scenarios, fixed-concentration Pareto analysis, and uncertainty tests.
-It writes a timestamped results directory and a ZIP; previous runs are preserved.
+It writes a timestamped results directory and a ZIP.
 Compact summaries and main figures appear in Colab; full tables stay in the ZIP.
 Open START_HERE.html after extracting the ZIP for the illustrated results guide.
 Conductivity is reported in S/m; mobility in cm^2/(V s); energy in eV/atom.
