@@ -3,7 +3,7 @@ Nominal screening substitutions: 1, 2, 3, 5, 10, 15 and 20% of the designated ho
 
 Five candidate dopants: Li, Na, K, N and P. No preferred dopant is hardcoded.
 This is a screening workflow, NOT a charged-defect DFT or Hall simulator.
-ML learns MP compound formation energies (eV/atom), not defect energies (eV/defect).
+ML learns MP compound formation energies (eV/atom).
 Literature activation energies are INPUTS.
 No experimental results are fabricated or used to force Na to rank first.
 
