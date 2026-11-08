@@ -5,7 +5,7 @@
 # ML predicts compound formation energy. Conductivity uses the existing physical scenario model.
 
 # ------------------------- USER SETTINGS -------------------------
-API_KEY = '4QoUiunPSMRpqOLTwA6qRu8edPSBArZD'  # Materials Project API key; no runtime prompt.
+API_KEY = '4QoUiunPSMRpqOLTwA6qRu8edPSBArZD'  
 SNO_OPTIONS = {
     "project_directory": "/content/SnO_OneCell_v5",
     "verbose_logs": False,
