@@ -1,4 +1,54 @@
-"""Doped alpha-SnO: literature-informed screening and Pareto analysis.
+# SnO: ONE-CELL COLAB RUNNER — conductivity, dopant selection and uncertainty, v5.0
+# Paste this ENTIRE file into ONE code cell in a fresh Google Colab notebook.
+# The full workflow and isolated package setup are included; an MP key is requested privately.
+# Li, Na, K, N and P are retained. All charts are calculated from the current run.
+# ML predicts compound formation energy. Conductivity uses the existing physical scenario model.
+
+# ------------------------- USER SETTINGS -------------------------
+SNO_OPTIONS = {
+    "project_directory": "/content/SnO_OneCell_v5",
+    "verbose_logs": False,
+    "setup_only": False,
+    "display_results": True,
+    "download_results": True,
+}
+SNO_SETTINGS = {
+    "run_size": "standard",
+    "requested_pareto_pct": [1, 2, 3, 5, 10, 15, 20],
+    "score_reference_pct": 5.0,
+    "sensitivity_concentrations": [3.0, 5.0],
+    "cached_raw_json": "",  # Optional raw_materials.json from a previous run.
+    "n_jobs": 2,
+    "display_results_inline": False,       # Parent notebook handles display.
+    "auto_download_zip_in_colab": False,   # Parent notebook handles download.
+}
+# Scoring weights, physical assumptions and all sampling settings are in CONFIG below.
+
+# Direct API/structure interfaces are pinned. Other dependencies use bounded
+# ranges so compatible available builds can be resolved for Python 3.12/3.13.
+# The EXACT resolved environment is saved with every successful result.
+SNO_REQUIREMENTS = """numpy>=2.1,<2.3
+scipy>=1.15,<2
+pandas>=2.2.3,<3
+scikit-learn>=1.6,<2
+matplotlib>=3.10,<4
+joblib>=1.4,<2
+mp-api==0.46.5
+pymatgen==2026.5.4
+pymatgen-core>=2026.2.24,<2027
+emmet-core>=0.86,<0.89
+monty>=2025.1.9,<2027
+pydantic>=2.11,<3
+requests>=2.32.5,<3
+ipython>=8.20,<10
+"""
+
+# The COMPLETE workflow is embedded below as readable source, not downloaded.
+# A fresh isolated interpreter executes it, avoiding Colab's loaded packages.
+SNO_WORKFLOW_SOURCE = r'''
+
+
+"""Doped alpha-SnO: formation-energy screening, conductivity and uncertainty.
 Nominal screening substitutions: 1, 2, 3, 5, 10, 15 and 20% of the designated host sublattice.
 
 Five candidate dopants: Li, Na, K, N and P. No preferred dopant is hardcoded.
@@ -7,12 +57,12 @@ ML learns MP compound formation energies (eV/atom).
 Literature activation energies are INPUTS.
 No experimental results are fabricated or used to force Na to rank first.
 
-Gradient Boosting is the only trained ML model. Execution downloads MP data,
+Gradient Boosting is the only trained estimator family (FE + sensitivity surrogates). Execution downloads MP data,
 performs grouped/nested hyperparameter tuning,
 held-out testing, leave-one-element-out transfer tests, group bootstrapping,
 transport scenarios, fixed-concentration Pareto analysis, and uncertainty tests.
 It writes a timestamped results directory and a ZIP.
-Compact summaries and main figures appear in Colab; full tables stay in the ZIP.
+Essential results and a short, readable equation guide appear in Colab. Full inputs, methods and source tables stay in the ZIP.
 Open START_HERE.html after extracting the ZIP for the illustrated results guide.
 Conductivity is reported in S/m; mobility in cm^2/(V s); energy in eV/atom.
 An explicit 0-100 preference score selects a candidate at one fixed concentration.
@@ -37,9 +87,9 @@ from getpass import getpass
 
 
 def ensure_dependencies():
-    """Install only missing dependencies before importing scientific modules."""
+    """Check imports only. Installation belongs in the isolated setup environment."""
     requirements = {
-        "numpy": "numpy>=1.26,<3", "scipy": "scipy>=1.13,<2",
+        "numpy": "numpy>=1.26,<2.3", "scipy": "scipy>=1.13,<2",
         "pandas": "pandas>=2.2,<3", "sklearn": "scikit-learn>=1.5,<2",
         "matplotlib": "matplotlib>=3.8,<4", "joblib": "joblib>=1.4,<2",
         "pymatgen.core": "pymatgen==2026.5.4", "mp_api.client": "mp-api==0.46.5",
@@ -50,15 +100,11 @@ def ensure_dependencies():
                                 capture_output=True, text=True)
         if result.returncode:
             missing.append(package)
+            print(f"Import failure in {module}:\n" + result.stderr, file=sys.stderr)
     if missing:
-        print("Installing scientific dependencies. This can take a few minutes.")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *missing])
-        probe = subprocess.run([sys.executable, "-c",
-                               "import numpy,scipy,pandas,sklearn; from mp_api.client import MPRester"],
-                              capture_output=True, text=True)
-        if probe.returncode:
-            raise RuntimeError("Dependency import failed. Start a fresh Colab runtime and run again. "
-                               "Do not continue with partially imported packages.")
+        raise RuntimeError("Missing or broken imports: " + ", ".join(missing) +
+                           ". Run the supplied isolated-environment setup first. "
+                           "This script will not change Colab's system packages.")
 
 
 if __name__ == "__main__":
@@ -71,13 +117,14 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.special import expit
 from scipy.constants import elementary_charge, Boltzmann, h, m_e
+from scipy.stats import spearmanr
 from sklearn.base import clone
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.feature_selection import VarianceThreshold
 from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.model_selection import GroupShuffleSplit, GroupKFold, GridSearchCV
+from sklearn.model_selection import GroupShuffleSplit, GroupKFold, GridSearchCV, train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.neighbors import NearestNeighbors
 from sklearn.inspection import permutation_importance
@@ -88,7 +135,7 @@ from mp_api.client import MPRester
 
 
 # ------------------------- EDITABLE CONFIGURATION -------------------------
-API_KEY = '4QoUiunPSMRpqOLTwA6qRu8edPSBArZD'
+API_KEY = ""  # Prefer hidden prompt or MP_API_KEY environment variable.
 
 CONFIG = {
     "seed": 42,
@@ -129,9 +176,14 @@ CONFIG = {
     # Conductivity already includes mobility; the extra mobility weight deliberately
     # values mobility retention. Weight/removal sensitivity is exported separately.
     "score_reference_pct": 5.0,             # % of the substituted Sn or O sublattice
-    "score_weights": {"formation_energy": .25, "conductivity": .50, "mobility": .25},
+    "score_weights": {"formation_energy": 0.0, "conductivity": 2.0/3.0, "mobility": 1.0/3.0},
     "score_weight_draws": 2000,             # uniform-simplex preference sensitivity
     "score_close_margin_points": 2.0,
+    # New modules: settings are written into run_config.json.
+    "sensitivity_concentrations": [3.0, 5.0],
+    "sensitivity_min_R2": .80,
+    "sensitivity_permutation_repeats": 20,
+
 }
 
 # Populated at the end of the run; use these DataFrames in later Colab cells.
@@ -157,7 +209,7 @@ ACCEPTORS = [d for d in DOPANTS if ROLES[d] != "donor_control"]
 # in a single-level acceptor model below is an explicit screening approximation.
 EA = {
     "Na": (.020, .015, .025, "10.1021/acs.jpcc.2c06397", "reported_effective_activation"),
-    "K":  (.015, .010, .020, "10.1063/5.0288742", "reported_effective_activation"),
+    "K":  (.015, .0111, .0204, "10.1063/5.0288742", "reported_effective_activation"),
     "N":  (.125, .100, .150, "10.1063/1.5052606", "reported_effective_activation"),
     "Li": (.060, .005, .150, "", "unvalidated_scenario_assumption"),
     "P":  (.150, .030, .400, "", "unvalidated_scenario_assumption"),
@@ -173,6 +225,9 @@ CHI = {"Li": .98, "Na": .93, "K": .82, "N": 3.04, "P": 2.19,
 
 # Explicit assumptions, NOT fitted material parameters. Replace with measured
 # values for a specified process before attempting a quantitative device claim.
+# Simplified mobility: A = alloy_scattering; B = ion_scattering (dimensionless).
+# mass_penalty and m_transport_over_me are retained only for the legacy mass
+# diagnostic column; neither enters mobility, conductivity or its surrogates.
 PHYSICS = {
     "p0_cm3": 1e18, "mu0_cm2_Vs": 10.0,
     "m_dos_over_me": .5, "m_transport_over_me": .5,
@@ -208,7 +263,7 @@ BENCHMARKS = [
          context="workbook summary; 2.3-2.8 percent basis requires full-text verification"),
     dict(dopant="Na", property="mu_cm2_Vs", low=10., high=np.nan,
          source="10.1021/acs.jpcc.2c06397", use="unpaired_lower_bound", context="not a sample-matched mobility row"),
-    dict(dopant="K", property="effective_activation_eV", low=.010, high=.020,
+    dict(dopant="K", property="effective_activation_eV", low=.0111, high=.0204,
          source="10.1063/5.0288742", use="input_not_validation", context="suboxide MBE"),
     dict(dopant="K", property="p_cm3", low=4.8e17, high=1.5e19,
          source="10.1063/5.0288742", use="unpaired_literature_range", context="reported without significant mobility loss"),
@@ -231,8 +286,15 @@ def write_json(path, value):
     Path(path).write_text(json.dumps(value, indent=2, default=convert), encoding="utf-8")
 
 
+# CSVs are also machine-readable inputs to later calculations and audits.
+# Seventeen significant digits preserve IEEE-754 float64 values on a matching
+# round-trip read. These extra digits do not imply physical measurement accuracy.
+CSV_FLOAT_FORMAT = "%.17g"
+
+
 def csv_out(frame, path):
-    frame.to_csv(path, index=False, float_format="%.10g")
+    """Preserve computational precision; round only in human-facing displays."""
+    frame.to_csv(path, index=False, float_format=CSV_FLOAT_FORMAT)
 
 
 def get_api_key():
@@ -256,12 +318,17 @@ def fetch_data(cfg, out, api_key=None):
         if not {"ternaries", "hosts", "query"} <= raw.keys():
             raise ValueError("Cache must be raw_materials.json produced by this script.")
         old = raw["query"]
-        if old["hull_max"] != cfg["mp_hull_max_eV_atom"] or old["include_gnome"] != cfg["include_gnome"]:
-            raise ValueError("Cached query differs from CONFIG. Match settings or download fresh data.")
+        if old.get("include_gnome") != cfg["include_gnome"]:
+            raise ValueError("Cached include_gnome setting differs from CONFIG.")
+        if old.get("download_scope") != "all_non_deprecated_ternaries_and_all_SnO":
+            print("WARNING: legacy cache may omit records. Counts cover only the cached retrieval.")
+            raw["inventory_warning"] = "legacy_filtered_cache_may_be_incomplete"
+            if cfg["mp_hull_max_eV_atom"] > old.get("hull_max", 0):
+                raise ValueError("Legacy cache is narrower than the requested training hull range; download fresh.")
     else:
         fields = ["material_id", "formula_pretty", "structure", "symmetry",
                   "formation_energy_per_atom", "energy_above_hull", "band_gap",
-                  "is_metal", "theoretical"]
+                  "is_metal", "theoretical", "deprecated"]
         def serialize(doc):
             obj = {f: getattr(doc, f, None) for f in fields}
             obj["material_id"] = str(obj["material_id"])
@@ -269,11 +336,11 @@ def fetch_data(cfg, out, api_key=None):
             sym = obj["symmetry"]
             obj["symmetry"] = sym.model_dump(mode="json") if hasattr(sym, "model_dump") else sym
             return obj
-        print("Downloading nondeprecated Sn-O-A ternaries and alpha-SnO references...")
+        print("Progress: Downloading Materials Project bulk references...")
         with MPRester(api_key or get_api_key(), timeout=60) as mpr:
+            # Preserve raw entries first; apply the ML training cutoff locally.
             ternaries = mpr.materials.summary.search(
                 elements=["Sn", "O"], num_elements=3, deprecated=False,
-                energy_above_hull=(0., cfg["mp_hull_max_eV_atom"]),
                 include_gnome=cfg["include_gnome"], fields=fields)
             hosts = mpr.materials.summary.search(formula="SnO", deprecated=False,
                                                  include_gnome=False, fields=fields)
@@ -282,7 +349,9 @@ def fetch_data(cfg, out, api_key=None):
                    "query": {"hull_max": cfg["mp_hull_max_eV_atom"],
                              "include_gnome": cfg["include_gnome"],
                              "retrieved_utc": datetime.now(timezone.utc).isoformat(),
-                             "database_version": mpr.db_version}}
+                             "database_version": mpr.get_database_version(),
+                             "download_scope": "all_non_deprecated_ternaries_and_all_SnO",
+                             "training_hull_cutoff_applied_locally": True}}
     write_json(out / "raw_materials.json", raw)
     csv_out(pd.DataFrame([{k: d.get(k) for k in ["material_id", "formula_pretty",
         "formation_energy_per_atom", "energy_above_hull", "band_gap", "is_metal", "theoretical"]}
@@ -339,14 +408,17 @@ def features(comp, structure, a_symbol=None, virtual=False):
     return ans
 
 
-def curate(raw, out):
+def curate(raw, out, cfg):
     hosts = []
     for d in raw["hosts"]:
         s = Structure.from_dict(d["structure"])
         sym = d.get("symmetry") or {}
-        if (s.composition.reduced_formula == "SnO" and sym.get("number") == 129
-                and d.get("is_metal") is not True
-                and np.isfinite(numeric(d.get("formation_energy_per_atom")))):
+        if (s.is_ordered and s.composition.reduced_formula == "SnO" and sym.get("number") == 129
+                and d.get("is_metal") is False
+                and numeric(d.get("band_gap")) > 0
+                and np.isfinite(numeric(d.get("formation_energy_per_atom")))
+                and np.isfinite(numeric(d.get("energy_above_hull")))
+                and d.get("deprecated") is not True):
             hosts.append(d)
     if not hosts:
         raise RuntimeError("No semiconducting P4/nmm (129) SnO reference found. Host selection cannot be guessed.")
@@ -367,12 +439,17 @@ def curate(raw, out):
             if len(others) != (0 if mid == host["material_id"] else 1): raise ValueError("not an A-Sn-O ternary")
             y = numeric(d.get("formation_energy_per_atom"))
             if not np.isfinite(y): raise ValueError("missing formation energy")
+            hull = numeric(d.get("energy_above_hull"))
+            if not np.isfinite(hull) or hull < -1e-7 or hull > cfg["mp_hull_max_eV_atom"]:
+                raise ValueError("outside bulk training hull cutoff or missing hull energy")
+            if d.get("deprecated") is True: raise ValueError("deprecated")
             a = others[0] if others else None
             if a in EXCLUDED_ELEMENTS: raise ValueError("element explicitly excluded from this workflow")
             row = {"material_id": mid, "formula": comp.reduced_formula, "A": a or "HOST",
                    "formation_energy_eV_atom": y, "hull_eV_atom": numeric(d.get("energy_above_hull")),
                    "band_gap_eV_audit_only": numeric(d.get("band_gap")),
-                   "nsites_audit_only": len(s), "source": "Materials_Project"}
+                   "nsites_audit_only": len(s), "source": "Materials_Project",
+                   "learning_domain_audit_only": "compound_formation_energy"}
             row.update(features(comp, s, a))
             rows.append(row)
         except (ValueError, TypeError, KeyError) as exc:
@@ -390,9 +467,10 @@ def curate(raw, out):
 
 
 def get_feature_columns(data, cfg):
-    audit = {"material_id", "formula", "A", "formation_energy_eV_atom", "hull_eV_atom",
-             "band_gap_eV_audit_only", "nsites_audit_only", "source"}
-    return [c for c in data if c not in audit and (cfg["use_structure_features"] or not c.startswith("struct_"))]
+    # Explicit allow-list prevents provenance metadata from becoming features.
+    core = {"Sn_fraction", "O_fraction", "A_fraction", "entropy"}
+    return [c for c in data if (c in core or c.startswith(("mean_", "std_", "A_weighted_"))
+            or (cfg["use_structure_features"] and c.startswith("struct_")))]
 
 
 def gradient_boosting_spec(cfg):
@@ -679,9 +757,12 @@ def transport(candidates, nsite_cm3, params, cfg, ea_values=None, efficiency=Non
     dc = np.array([abs(CHI[s]-CHI[SITES[s]]) for s in d])
     compatibility = np.exp(-1.6*dr-.45*dc)       # geometry/chemistry index ONLY
     penalty = dr if radius_penalty else np.zeros_like(dr)
+    # Preserve the legacy mass diagnostic without using it in mobility.
     mass_ratio = 1.+x*(params["mass_penalty"]*penalty + .1*dc)
-    retention = mass_ratio**-2/(1.+params["alloy_scattering"]*x*(1.-x)*(penalty**2+.15*dc**2)
-                              +params["ion_scattering"]*x*eta)
+    # A = alloy_scattering; B = ion_scattering; eta = active dopant fraction.
+    # mu = mu0 / [1 + A*x*(1-x)*(dr^2 + 0.15*dc^2) + B*x*eta].
+    retention = 1./(1.+params["alloy_scattering"]*x*(1.-x)*(penalty**2+.15*dc**2)
+                    +params["ion_scattering"]*x*eta)
     p, ionization, fermi = solve_holes(na, ea, params, cfg["temperature_K"])
     # The hole-only neutrality model must not silently enter a bipolar regime.
     # This conservative midgap-minus-3kT guard assumes comparable DOS prefactors;
@@ -821,6 +902,8 @@ def pareto_analysis(screen, cfg, out):
 def sample_parameters(rng):
     pars = deepcopy(PHYSICS)
     # These bounds express sensitivity assumptions, not estimated confidence intervals.
+    # Keep the legacy mass-diagnostic draw to preserve the random-number sequence
+    # for all other inputs; mass_penalty no longer affects transport.
     pars.update(p0_cm3=10**rng.uniform(np.log10(2e17), 19), mu0_cm2_Vs=rng.uniform(3., 30.),
                 m_dos_over_me=rng.uniform(.3, 1.5), active_fraction=10**rng.uniform(-2., 0.),
                 compensation_fraction=rng.uniform(0., .5), mass_penalty=rng.uniform(.25, 1.0),
@@ -843,13 +926,16 @@ def robustness(screen, boot, data, oof, nsite, cfg, out):
     no_radius_draws = np.full_like(rank_draws, np.nan)
     p_draws, mu_draws, sigma_draws = [np.full_like(rank_draws, np.nan) for _ in range(3)]
     fe_draws = np.full_like(rank_draws, np.nan)
-    modes = []
+    modes, sampled_inputs = [], []
     for draw in range(n_draws):
         pars = sample_parameters(rng)
         mode = "shared_efficiency" if draw < n_draws//2 else "dopant_specific_efficiency"
         modes.append(mode)
         effective = {d: (pars["active_fraction"] if mode == "shared_efficiency" else 10**rng.uniform(-2., 0.)) for d in DOPANTS}
         ea = {d: (rng.uniform(EA[d][1], EA[d][2]) if np.isfinite(EA[d][0]) else np.nan) for d in DOPANTS}
+        sampled_inputs.append(dict(draw_id=draw, efficiency_mode=mode, **pars,
+            **{f"efficiency_{d}": effective[d] for d in DOPANTS},
+            **{f"EA_{d}_eV": ea[d] for d in DOPANTS}))
         # Systematic error shared along each dopant's concentration series.
         bias = {d: rng.choice(group_residuals) for d in DOPANTS}
         props = transport(base, nsite, pars, cfg, ea_values=[ea[d] for d in base.dopant],
@@ -898,6 +984,7 @@ def robustness(screen, boot, data, oof, nsite, cfg, out):
         result[f"pareto_frequency_{mode}"] = frequency(rank_draws[mask])
         result[f"compromise_share_{mode}"] = share_draws[mask].mean(axis=0)
     csv_out(result, out / "robustness_results.csv")
+    csv_out(pd.DataFrame(sampled_inputs), out / "mc_input_draws.csv")
     np.savez_compressed(out / "mc_scenario_draws.npz", ranks=rank_draws, compromise_shares=share_draws,
                         supported_ranks=support_draws, no_radius_ranks=no_radius_draws,
                         p_cm3=p_draws, mu_cm2_Vs=mu_draws, sigma_S_m=sigma_draws,
@@ -908,7 +995,7 @@ def robustness(screen, boot, data, oof, nsite, cfg, out):
 
 
 # ------------------ DATA COUNTS AND DOPANT PREFERENCE SCORE -----------------
-SCORE_KEYS = ["formation_energy", "conductivity", "mobility"]
+SCORE_KEYS = ["formation_energy", "conductivity", "mobility"]  # FE retained in exported schema only; weight = 0, so no effect on scoring.
 
 
 def validate_score_config(cfg):
@@ -925,6 +1012,10 @@ def validate_score_config(cfg):
     w = np.asarray([weights[k] for k in SCORE_KEYS], float)
     if not np.isfinite(w).all() or (w < 0).any() or w.sum() <= 0:
         raise ValueError("Score weights must be finite, nonnegative and have a positive sum.")
+    if not np.isclose(w[0], 0.0, rtol=0, atol=1e-12):
+        raise ValueError("Formation energy must have zero preference-score weight; only conductivity and mobility are scored.")
+    if w[1] <= 0 or w[2] <= 0:
+        raise ValueError("Use positive preference-score weights for both conductivity and mobility.")
     # Any concentration in the screening grid may be selected.
     # Model-scope eligibility is assessed separately; references above the
     # dilute limit remain exploratory rather than expanding the model scope.
@@ -953,7 +1044,7 @@ def write_dataset_summary(data, raw, out):
     distribution["percent_of_final_dataset"] = 100.*distribution.structures/len(data)
     csv_out(summary, out / "dataset_summary.csv")
     csv_out(distribution, out / "dopant_distribution.csv")
-    print(f"Final filtered ML dataset: {len(data)} structures / {data.formula.nunique()} unique compositions.")
+    print(f"Bulk ML dataset: {len(data)} structures / {data.formula.nunique()} unique compositions.")
     print(f"Target dopants: {requested.sum()} structures; other elements: {(~requested & ~host).sum()}; host: {host.sum()}.")
     print("Target-dopant structure counts: " + ", ".join(f"{r.dopant}={r.structures}" for r in distribution.itertuples()))
     return summary, distribution
@@ -967,8 +1058,9 @@ def score_costs(frame):
     log_sigma[good] = np.log10(sigma[good])
     costs = np.column_stack([frame.FE_ML_eV_atom.to_numpy(float), -log_sigma,
                             -frame.mu_scenario_cm2_Vs.to_numpy(float)])
-    # Donor controls stay outside this p-type selection even if the user sets
-    # both transport weights to zero; their FE curves remain fully exported.
+    # The FE column is retained for backward-compatible exports; the zero FE
+    # weight makes selection depend ONLY on log conductivity and mobility.
+    # Donor controls stay outside p-type selection.
     costs[frame.dopant.map(ROLES).eq("donor_control").to_numpy(), :] = np.nan
     return costs
 
@@ -1019,13 +1111,14 @@ def winner_shares(values, eligible=None):
 def dopant_scoring(screen, cfg, out):
     """Application-specific decision after property prediction, not ML training.
 
-    Default score = 100*(0.25*U_FE + 0.50*U_log_sigma + 0.25*U_mu).
+    Default score = 100*((2/3)*U_log_sigma + (1/3)*U_mu).
+    The formation-energy term is zero-weighted and excluded from selection.
     Removing a candidate changes min-max anchors; scores must be recomputed for
     the five-dopant candidate set rather than copied from an earlier run.
     Units: eV/atom, S/m and cm^2/(V s). Utilities run from 0 (worst) to 1
     (best) among complete alternatives at the SAME sublattice concentration.
-    The highest score among gate-passing candidates is selected if any exist;
-    otherwise the highest finite score is explicitly an exploratory candidate.
+    The highest score with valid transport quantities is selected; energetics
+    remain separate evidence diagnostics, not preference criteria.
     """
     w = validate_score_config(cfg)
     rows = []
@@ -1057,7 +1150,9 @@ def dopant_scoring(screen, cfg, out):
     costs = score_costs(central)
     utility, score, valid, anchors = normalized_desirability(costs, w)
     supported = valid & ref.supported_screening.to_numpy(bool)
-    selection_pool = supported if supported.any() else valid
+    # Evidence/applicability gates are reported but must not filter the two-property score
+    # (those gates include formation-energy prediction quality and coverage).
+    selection_pool = valid
     shares = winner_shares(score, selection_pool)
     selected = [d for d, share in zip(DOPANTS, shares) if share > 0]
     ref["rank"] = pd.Series(score).rank(method="min", ascending=False).to_numpy()
@@ -1067,9 +1162,10 @@ def dopant_scoring(screen, cfg, out):
     ref["within_close_score_margin"] = selection_pool & (best-score <= cfg["score_close_margin_points"])
     # Uniform-simplex weights explore preference choices, not their probabilities.
     rng = np.random.default_rng(cfg["seed"]+303)
-    weight_vectors = rng.dirichlet(np.ones(3), size=int(cfg["score_weight_draws"]))
-    all_criteria_valid = np.isfinite(costs).all(axis=1)
-    sweep_u, _, sweep_valid, _ = normalized_desirability(costs, np.ones(3)/3.)
+    transport_weights = rng.dirichlet(np.ones(2), size=int(cfg["score_weight_draws"]))
+    weight_vectors = np.column_stack([np.zeros(len(transport_weights)), transport_weights])
+    all_criteria_valid = np.isfinite(costs[:, 1:]).all(axis=1)
+    sweep_u, _, sweep_valid, _ = normalized_desirability(costs, np.array([0., .5, .5]))
     sweep_scores = 100.*(np.nan_to_num(sweep_u, nan=0.) @ weight_vectors.T).T
     sweep_scores[:, ~sweep_valid] = np.nan
     weight_wins = np.asarray([winner_shares(v, selection_pool & all_criteria_valid) for v in sweep_scores])
@@ -1079,19 +1175,20 @@ def dopant_scoring(screen, cfg, out):
     csv_out(pref, out / "score_weight_sensitivity.csv")
     # Leave-one-criterion-out and equal-weight alternatives expose correlation
     # between conductivity and mobility and sensitivity to the energy proxy.
-    alternatives = {"configured": w, "equal_weights": np.ones(3)/3.}
+    alternatives = {"configured": w, "equal_weights": np.array([0., .5, .5])}
     for k, name in enumerate(SCORE_KEYS):
+        if k == 0: continue  # Already excluded: no duplicate without_energy analysis.
         alt = w.copy(); alt[k] = 0.
         if alt.sum() > 0: alternatives[f"without_{name}"] = alt/alt.sum()
     ablations = []
     for label, weights in alternatives.items():
-        _, vals, _, _ = normalized_desirability(costs, weights)
+        _, vals, _, _ = normalized_desirability(costs, weights, anchors=anchors)
         tops = winner_shares(vals, selection_pool)
         for d, value, top in zip(DOPANTS, vals, tops):
             ablations.append({"variant": label, "dopant": d, "score_0_100": value,
                               "top_share": top, **dict(zip([f"weight_{k}" for k in SCORE_KEYS], weights))})
     csv_out(pd.DataFrame(ablations), out / "score_criterion_sensitivity.csv")
-    # Reuse the SAME FE and physical draws used by the Pareto analysis.
+    # Reuse the SAME saved draws used by Pareto analysis; FE is zero-weighted and has no score effect.
     with np.load(out / "mc_scenario_draws.npz", allow_pickle=False) as mc:
         indexes = [int(np.flatnonzero((mc["dopants"] == d) & np.isclose(
             mc["substitution_pct"], cfg["score_reference_pct"], atol=1e-9, rtol=0))[0]) for d in DOPANTS]
@@ -1127,7 +1224,7 @@ def dopant_scoring(screen, cfg, out):
     csv_out(compact, out / "dopant_score_summary.csv")
     result = {"selected_dopant": selected[0] if len(selected) == 1 else None,
         "selected_dopants": selected,
-        "selection_status": ("conditional_supported_screening" if supported.any() else
+        "selection_status": ("conditional_supported_screening" if len(selected) and all(d in set(ref.loc[ref.supported_screening, "dopant"]) for d in selected) else
                              "exploratory_score_candidate" if valid.any() else "no_eligible_candidate"),
         "substitution_pct": cfg["score_reference_pct"], "temperature_K": cfg["temperature_K"],
         "weights": dict(zip(SCORE_KEYS, w)), "highest_score_in_selection_pool": best,
@@ -1218,11 +1315,10 @@ def write_selection_interpretation(data, screen, scores, selection, validation, 
     decision = (f"At {pct:g}% sublattice substitution and {cfg['temperature_K']:g} K, " +
                 (f"the selected candidate{'s are' if len(selected)>1 else ' is'} {', '.join(selected)}."
                  if selected else "no candidate has a complete eligible score."))
-    selection_rule = ("The code compares candidates at the same concentration. It scales lower formation energy, "
-        "higher log conductivity and higher mobility to desirabilities between 0 and 1. Score = 100 times their weighted sum. "
+    selection_rule = ("The code compares candidates at the same concentration. It scales higher log conductivity "
+        "and higher mobility to desirabilities between 0 and 1. Formation energy is not scored. Score = 100 times their weighted sum. "
         "Configured weights: " + ", ".join(f"{k.replace('_',' ')} {100*v:g}%" for k,v in selection["weights"].items()) + ". " +
-        ("Selection is restricted to candidates passing all screening checks." if selection["supported_candidate_count"] else
-         "No candidate passes all screening checks, so the highest score is reported as an exploratory candidate.") +
+        "The score selects among candidates with valid transport values; ML energy evidence is reported separately." +
         " Exact score ties remain co-selected.")
     deltas = []
     for d in selected:
@@ -1233,7 +1329,7 @@ def write_selection_interpretation(data, screen, scores, selection, validation, 
             alternatives = valid[~valid.index.isin(selected)]
             outside_pool = bool(len(alternatives))
         rival = alternatives.sort_values("score_0_100", ascending=False).index[0] if len(alternatives) else None
-        parts = [f"{100*selection['weights'][k]:g}% weight gives {s[f'points_{k}']:.2f} {k.replace('_',' ')} points" for k in SCORE_KEYS]
+        parts = [f"{100*selection['weights'][k]:g}% weight gives {s[f'points_{k}']:.2f} {k.replace('_',' ')} points" for k in SCORE_KEYS if selection["weights"][k] > 0]
         why = f"{d} obtains {s.score_0_100:.2f}/100: " + "; ".join(parts) + "."
         tradeoffs = []
         if rival is not None:
@@ -1242,6 +1338,7 @@ def write_selection_interpretation(data, screen, scores, selection, validation, 
             if outside_pool:
                 why += " That alternative is outside the gate-passing selection pool and is shown only for comparison."
             for key, column, label, unit, lower in properties:
+                if selection["weights"][key] <= 0: continue
                 value, other = float(s[column]), float(r[column])
                 delta = float(s[f"points_{key}"]-r[f"points_{key}"])
                 deltas.append({"selected_dopant": d, "alternative": rival, "criterion": key,
@@ -1265,7 +1362,7 @@ def write_selection_interpretation(data, screen, scores, selection, validation, 
             "Radius-mismatch and scattering assumptions reduce mobility; the score balances the carrier benefit against that mobility loss. "
             "This mechanism is a screening approximation, not a measured defect-physics result.")
         stability = (f"{d}'s top-choice share is {number(100*s.weight_sweep_top_share,3)}% in the preference-weight sweep and "
-            f"{number(100*s.scenario_top_share,3)}% in the combined energy/transport scenarios. "
+            f"{number(100*s.scenario_top_share,3)}% in the sampled transport scenarios. "
             "These are sensitivity frequencies with ties shared, not probabilities of experimental success.")
         if rival is None: tradeoffs.append("No other scored candidate is available for a numerical comparison.")
         explanation.append({"dopant": d, "why_selected": why, "advantages": strengths,
@@ -1285,31 +1382,27 @@ def write_selection_interpretation(data, screen, scores, selection, validation, 
               "candidates": explanation, "limits_and_next_evidence": limitations,
               "comparison_note": "Advantages/disadvantages compare central predictions with the scored-peer median; no additional eligibility threshold is imposed."}
     write_json(out / "selection_interpretation.json", report)
-    lines = ["DOPANT SELECTION — INTERPRETATION", "", decision, "", "HOW THE SELECTION IS MADE", selection_rule]
+    lines = ["DOPANT SELECTION", decision, "Status: " + selection["selection_status"], selection_rule]
     for item in explanation:
-        lines += ["", f"WHY {item['dopant']} IS SELECTED", item["why_selected"],
-                  "", "ADVANTAGES (conditional on the model)", item["advantages"],
-                  "", "DISADVANTAGES AND LIMITATIONS", item["disadvantages"],
-                  "", "TRADE-OFFS AGAINST THE ALTERNATIVE", *["- "+t for t in item["tradeoffs"]],
-                  "", "PHYSICAL INTERPRETATION", item["physical_interpretation"],
-                  "", "HOW SENSITIVE IS THE CHOICE?", item["selection_sensitivity"]]
-    lines += ["", "EVIDENCE NEEDED NEXT", limitations]
+        lines += ["", item["why_selected"], *item["tradeoffs"], item["selection_sensitivity"],
+                  "Failed gates: " + ("; ".join(item["failed_screening_checks"]) or "none")]
+    lines += ["", "All-dopant comparisons: dopant_advantages_disadvantages.csv.",
+              "Physical model, assumptions and sources: CALCULATION_REFERENCE.txt.",
+              "Experimental comparison: " + str(validation["experimental_validation"]) + "."]
     (out / "selection_interpretation.txt").write_text("\n".join(lines)+"\n", encoding="utf-8")
     return report, pd.DataFrame(deltas, columns=comparison_columns)
 
 
 def selection_interpretation_html(report):
-    """The same interpretation appears in Colab and in the portable ZIP report."""
+    """Essential decision evidence; complete comparative tables remain exported."""
     from html import escape
-    parts = ['<h2>Why this dopant was selected</h2>', '<p>'+escape(report["decision"])+'</p>',
-             '<p>'+escape(report["selection_rule"])+'</p>']
+    parts = ['<p>' + escape(report["decision"]) + '</p>']
     for item in report["candidates"]:
-        parts.append('<h3>'+escape(item["dopant"])+': selection and trade-offs</h3><p>'+escape(item["why_selected"])+ '</p>')
-        for key, title in [("advantages", "Advantages"), ("disadvantages", "Disadvantages"),
-                           ("physical_interpretation", "Physical interpretation"), ("selection_sensitivity", "Sensitivity")]:
-            parts.append('<p><strong>'+title+': </strong>'+escape(item[key])+'</p>')
-        parts.append('<ul>'+''.join('<li>'+escape(t)+'</li>' for t in item["tradeoffs"])+ '</ul>')
-    parts.append('<p><strong>Evidence needed next: </strong>'+escape(report["limits_and_next_evidence"])+ '</p>')
+        parts.append('<h3>' + escape(item["dopant"]) + '</h3><p>' + escape(item["why_selected"]) + '</p>')
+        parts.append('<ul>' + ''.join('<li>' + escape(t) + '</li>' for t in item["tradeoffs"]) + '</ul>')
+        parts.append('<p>Failed gates: ' + escape('; '.join(item["failed_screening_checks"]) or 'none') + '.</p>')
+        parts.append('<p>' + escape(item["selection_sensitivity"]) + '</p>')
+    parts.append('<p>Full comparisons: dopant_advantages_disadvantages.csv and selected_dopant_tradeoffs.csv.</p>')
     return '\n'.join(parts)
 
 
@@ -1439,7 +1532,9 @@ def write_starting_structures(host_structure, cfg, out):
         Poscar(s, comment=f"UNRELAXED alpha-SnO; {d} on {SITES[d]}; {actual_pct:.6f}% sublattice").write_file(folder/name)
         records.append({"dopant": d, "site": SITES[d], "atoms": len(s), "substitutions": 1,
                         "requested_pct": cfg["structure_target_pct"], "actual_substitution_pct": actual_pct,
-                        "total_atom_pct": 100./len(s), "status": "unrelaxed_starting_geometry", "file": name})
+                        "total_atom_pct": 100./len(s), "status": "unrelaxed_starting_geometry_no_DFT_run", "file": name,
+                        "new_dft_calculation_performed": False, "relaxed_by_this_workflow": False,
+                        "generation_method": "atomic_substitution_in_host_supercell"})
     csv_out(pd.DataFrame(records), out / "starting_structure_manifest.csv")
 
 
@@ -1482,8 +1577,33 @@ COLORS = dict(zip(DOPANTS, ["#3B6FB6", "#DE8F05", "#029E73", "#D55E00",
 
 
 def save_figure(fig, path):
-    fig.savefig(str(path)+".png", dpi=240, bbox_inches="tight")
-    fig.savefig(str(path)+".pdf", bbox_inches="tight")
+    """Export every original figure as high-resolution PNG and vector PDF.
+
+    Uniformly increase legibility and show complete panel borders. This only
+    changes presentation; original underlying data and uncertainties are not
+    changed. Axes deliberately switched off (workflow, unused panels) stay off.
+    """
+    for ax in fig.axes:
+        if not ax.axison:
+            continue
+        for spine in ax.spines.values():
+            spine.set_visible(True)
+            spine.set_linewidth(max(spine.get_linewidth(), 1.15))
+        ax.tick_params(axis="both", which="major", labelsize=11, width=1.0)
+        ax.tick_params(axis="both", which="minor", width=0.8)
+        ax.xaxis.label.set_fontsize(max(12.0, ax.xaxis.label.get_fontsize()))
+        ax.yaxis.label.set_fontsize(max(12.0, ax.yaxis.label.get_fontsize()))
+        ax.title.set_fontsize(max(13.0, ax.title.get_fontsize()))
+        for label in ax.texts:
+            label.set_fontsize(max(10.0, label.get_fontsize()))
+        legend = ax.get_legend()
+        if legend is not None:
+            for t in legend.get_texts():
+                t.set_fontsize(max(10.5, t.get_fontsize()))
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(path) + ".png", dpi=320, bbox_inches="tight", facecolor="white")
+    fig.savefig(str(path) + ".pdf", bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
 
@@ -1526,14 +1646,18 @@ def workflow_figure(folder):
 def make_figures(screen, pareto, robust, cfg, out):
     folder = out / "figures"
     folder.mkdir(exist_ok=True)
-    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 10,
-                         "axes.spines.top": False, "axes.spines.right": False,
+    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 12,
+                         "axes.labelsize": 12, "axes.titlesize": 14,
+                         "xtick.labelsize": 11, "ytick.labelsize": 11,
+                         "legend.fontsize": 11,
+                         "figure.titlesize": 17,
+                         "axes.spines.top": True, "axes.spines.right": True,
                          "pdf.fonttype": 42, "savefig.facecolor": "white"})
     workflow_figure(folder)
     metrics = pd.read_csv(out / "model_metrics.csv")
     pooled = pd.read_csv(out / "nested_oof_predictions.csv")
     held = pd.read_csv(out / "locked_test_predictions.csv")
-    fig, axes = plt.subplots(1, 3, figsize=(14.5, 4.4), layout="constrained")
+    fig, axes = plt.subplots(1, 3, figsize=(16.5, 5.6), layout="constrained")
     for ax, observed, predicted, title, color in [
         (axes[0], pooled.observed, pooled.predicted, "Nested grouped CV", "#3B6F91"),
         (axes[1], held.observed_eV_atom, held.predicted_eV_atom, "Locked composition-group test", "#26856C")]:
@@ -1561,7 +1685,7 @@ def make_figures(screen, pareto, robust, cfg, out):
     ax.text(.03, .96, "Bounds are scenario inputs,\nnot model confidence intervals", transform=ax.transAxes,
             ha="left", va="top", fontsize=9)
     save_figure(fig, folder / "03_activation_inputs")
-    fig, axes = plt.subplots(1, 2, figsize=(10.6, 4.4), layout="constrained")
+    fig, axes = plt.subplots(1, 2, figsize=(14.0, 5.8), layout="constrained")
     for d in DOPANTS:
         a = screen[(screen.dopant == d) & screen.substitution_pct.isin(cfg["requested_pareto_pct"])].sort_values("substitution_pct")
         r = robust[robust.dopant == d].sort_values("substitution_pct")
@@ -1578,7 +1702,7 @@ def make_figures(screen, pareto, robust, cfg, out):
         set_substitution_axis(ax, cfg)
     axes[0].legend(ncols=3, fontsize=9)
     save_figure(fig, folder / "04_transport_scenarios")
-    fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.8), layout="constrained")
+    fig, axes = plt.subplots(1, 2, figsize=(14.0, 5.8), layout="constrained")
     cmap = plt.colormaps["viridis"].copy(); cmap.set_bad("#E8E8E8")
     for ax, column, title in zip(axes, ["pareto_frequency", "supported_pareto_frequency"],
                                  ["Exploratory Pareto frequency", "After evidence and applicability gates"]):
@@ -1611,12 +1735,12 @@ def make_figures(screen, pareto, robust, cfg, out):
                     xytext=(5, 4), textcoords="offset points")
     ax.set(xlabel="Compound energy proxy (eV/atom); lower preferred",
            ylabel="log10(conductivity / [1 S/m]); higher preferred",
-           title=f"Exploratory screening at {pct:g}% substitution\nTwo-dimensional projection of five objectives")
+           title=f"Exploratory screening at {pct:g}% substitution\nTwo-objective projection of five objectives")
     ax.margins(x=.13, y=.12)
     fig.text(.13, .025, "Circles: first front in five objectives. Crosses: dominated. Open diamonds: incomplete objectives.\nProjection alone cannot establish dominance.",
              fontsize=8, va="bottom")
     save_figure(fig, folder / "06_Pareto_projection")
-    fig, axes = plt.subplots(2, 3, figsize=(10.8, 6.3), layout="constrained")
+    fig, axes = plt.subplots(2, 3, figsize=(15.5, 9.0), layout="constrained")
     for ax, d in zip(axes.ravel(), ACCEPTORS):
         a = screen[(screen.dopant == d) & screen.substitution_pct.isin(cfg["requested_pareto_pct"])].sort_values("substitution_pct")
         r = robust[robust.dopant == d].sort_values("substitution_pct")
@@ -1663,8 +1787,8 @@ def make_concentration_score_figures(all_scores, cfg, out):
     csv_out(numerical, out / "concentration_central_scores_independent.csv")
 
     weights = validate_score_config(cfg)
-    weight_note = (f"Weights: energy {100*weights[0]:g}%, log conductivity {100*weights[1]:g}%, "
-                   f"mobility {100*weights[2]:g}%.")
+    weight_note = (f"Weights: log conductivity {100*weights[1]:.1f}%, "
+                   f"mobility {100*weights[2]:.1f}% (formation energy excluded).")
     scope_note = ("Each concentration has its own min–max normalization; scores compare dopants within that concentration.\n"
                   "These scores do not define an optimum concentration.")
 
@@ -1758,28 +1882,29 @@ def make_added_figures(screen, score_details, all_scores, selection, cfg, out):
     for limit, name, title in [
         (maximum, "08_formation_energy_all_dopants", "Predicted compound formation energy: all five dopants"),
         (cfg["dilute_screening_limit_pct"], "09_formation_energy_dilute", "Formation energy in the declared dilute-model range")]:
-        fig, axes = plt.subplots(2, 3, figsize=(12.4, 7.2))
-        fig.subplots_adjust(left=.07, right=.985, bottom=.14, top=.88, wspace=.44, hspace=.55)
+        fig, axes = plt.subplots(2, 3, figsize=(16.0, 9.1))
+        fig.subplots_adjust(left=.075, right=.985, bottom=.11, top=.91, wspace=.42, hspace=.39)
         for ax, d in zip(axes.ravel(), DOPANTS): fe_axis(ax, d, limit)
         for ax in axes.ravel()[len(DOPANTS):]: ax.set_axis_off()
-        fig.suptitle(title, fontsize=15)
-        fig.text(.07, .02, "Lines: ML composition predictions. Shading: 5–95% group-bootstrap spread. Dashed: above the declared dilute-model limit.\n"
-                 "These are compound energies, not charged-defect energies; a dilute concentration alone does not establish applicability.", fontsize=9)
+        fig.suptitle(title, fontsize=18)
+        fig.text(.075, .025,
+                 "Shading: 5th–95th percentile bootstrap spread; estimates are compound, not defect, energies.",
+                 fontsize=10)
         save_figure(fig, folder / name)
     for d in DOPANTS:
         fig, axes = plt.subplots(1, 2, figsize=(10.6, 4.3), layout="constrained")
         fe_axis(axes[0], d, maximum); fe_axis(axes[1], d, cfg["dilute_screening_limit_pct"])
         fig.suptitle(f"{d}-doped SnO: compound-energy proxy and 5–95% bootstrap spread", fontsize=12)
         save_figure(fig, individual / f"FE_{d}_vs_concentration")
-    # Stacked bars show exactly how much each criterion contributes to the score.
+    # Two stacked components only: formation energy contributes zero score points.
     a = score_details.copy()
     fig, ax = plt.subplots(figsize=(10.4, 5.9))
     fig.subplots_adjust(left=.10, right=.94, bottom=.22, top=.85)
     left = np.zeros(len(a))
-    for name, color, label in zip(SCORE_KEYS, ["#3B6FB6", "#029E73", "#DE8F05"],
-                                  ["Formation energy", "log conductivity", "Mobility"]):
+    for name, color, label in [("conductivity", "#029E73", "log conductivity"),
+                               ("mobility", "#DE8F05", "Mobility")]:
         points = a[f"points_{name}"].fillna(0).to_numpy()
-        ax.barh(a.dopant, points, left=left, color=color, label=label, height=.65)
+        ax.barh(a.dopant, points, left=left, color=color, label=label, height=.65, edgecolor="#333333", linewidth=.75)
         left += points
     for i, row in enumerate(a.itertuples()):
         label = (f"{row.score_0_100:.1f}" + ("  SELECTED" if row.selected_at_reference else "")
@@ -1788,12 +1913,11 @@ def make_added_figures(screen, score_details, all_scores, selection, cfg, out):
     ax.invert_yaxis(); ax.set_xlim(0, 119)
     ax.set(xticks=[0, 20, 40, 60, 80, 100], xlabel="Dopant preference score (0–100; higher is preferred)",
            title=f"Dopant selection at {cfg['score_reference_pct']:g}% sublattice substitution\n{selection['selection_status'].replace('_', ' ')}")
-    ax.legend(loc="upper center", bbox_to_anchor=(.5, -.12), ncols=3, frameon=False)
-    fig.text(.10, .025, "Default weights: energy 25%, conductivity 50%, mobility 25% (editable). Missing acceptor transport is not scored.\n"
-             "Selection depends on the chosen concentration, weights and physical assumptions; it is not experimental confirmation.", fontsize=8.5)
-    # Show the actual configured weights even after the user edits them.
-    fig.texts[-1].set_text("Weights: " + ", ".join(f"{k.replace('_', ' ')} {100*v:g}%" for k, v in selection["weights"].items()) +
-        ". Missing acceptor transport is not scored.\nSelection depends on concentration, preferences and physical assumptions; it is not experimental confirmation.")
+    ax.legend(loc="upper center", bbox_to_anchor=(.5, -.12), ncols=2, frameon=False)
+    # Keep the active weighting visible without duplicating methodology.
+    fig.text(.10, .025, "Weights: " + ", ".join(
+        f"{k.replace('_', ' ')} {100*v:.1f}%" for k, v in selection["weights"].items() if v > 0)
+        + "; formation energy excluded. Exploratory score.", fontsize=10)
     save_figure(fig, folder / "10_dopant_score_components")
     make_concentration_score_figures(all_scores, cfg, out)
     dist = pd.read_csv(out / "dopant_distribution.csv")
@@ -1810,7 +1934,7 @@ def make_added_figures(screen, score_details, all_scores, selection, cfg, out):
     fig, axes = plt.subplots(1, 2, figsize=(11.6, 5.2))
     fig.subplots_adjust(left=.07, right=.98, bottom=.22, top=.85, wspace=.3)
     for ax, field, title in zip(axes, ["weight_sweep_top_share", "scenario_top_share"],
-                                ["Preference-weight sensitivity", "FE and physical-scenario sensitivity"]):
+                                ["Preference-weight sensitivity", "Physical-scenario sensitivity"]):
         vals = 100.*a[field]
         ax.bar(a.dopant, vals.fillna(0), color=[COLORS[d] for d in a.dopant])
         for i, value in enumerate(vals):
@@ -1825,7 +1949,7 @@ def make_added_figures(screen, score_details, all_scores, selection, cfg, out):
 def write_provenance(out, cfg):
     references = pd.DataFrame(REFERENCES, columns=["reference", "doi", "host_scope", "role"])
     references["url"] = "https://doi.org/" + references.doi
-    references["checked_date"] = "2026-09-06"
+    references["verification_status"] = "inherited_from_user_base_code_not_independently_reverified"
     csv_out(references, out / "references.csv")
     csv_out(pd.DataFrame(BENCHMARKS), out / "literature_reference_ranges.csv")
     csv_out(pd.DataFrame([{"dopant": d, "site": SITES[d], "role": ROLES[d],
@@ -1865,151 +1989,20 @@ def write_report(data, screen, robust, chosen, reliable, validation, selection, 
         f"Requested fixed-concentration analysis: {points}% of the substituted sublattice.\n"
         f"External experimental validation: {validation['experimental_validation']}.\n"
     )
-    notes = """
-INTERPRETATION
-The five candidate dopants are Li, Na, K, N and P. Li and P acceptor energies
-are explicitly unvalidated sensitivity assumptions. Literature-derived effective
-activation inputs are available for Na, K and N.
-
-Gradient Boosting is the only trained estimator family, prespecified for this workflow.
-Its hyperparameter tuning is nested inside the composition-group development folds.
-The locked test is not used for parameter tuning or feature selection. Element-transfer
-testing retunes Gradient Boosting using only the remaining elements. The quality gate
-also compares its test MAE with an arithmetic training-mean reference, computed without
-fitting any additional model. Only GB bootstrap and residual uncertainty are reported;
-there is no cross-model disagreement estimate. These tests concern compound energies,
-not dopant activation, solubility, Hall transport, or virtual-structure accuracy.
-
-Only compound formation energy is learned. Lower MP formation energy across different
-chemistries does not prove easier dopant incorporation. True charged-defect energies
-require chemical potentials, charge states, Fermi energy and finite-size corrections.
-The competing-ternary proxy is not a chemical-potential phase diagram: it omits elemental
-and binary competition and inherits database coverage bias. Its removal is tested.
-
-The central physical parameters and Monte Carlo ranges are declared assumptions, not
-fitted experimental values. p follows a single-acceptor charge-neutrality model with
-Fermi-Dirac hole statistics, a fixed ionized UID background, and fully ionized compensating
-donors. The apparent literature activation energy is used as an effective level only
-for screening. Impurity bands, concentration-dependent level shifts, defect complexes,
-microstructure, anisotropy and Hall factors are not determined by this model.
-Reference curves assume zero donor compensation. Monte Carlo explores 0-50% compensation;
-the reference curves are not medians of the scenario ensemble. This keeps the baseline
-acceptor response distinct from hypothetical compensation-induced carrier suppression.
-A conservative midgap-minus-3kT check suppresses conductivity estimates where neglect
-of electrons may fail. The 0.67 eV indirect-gap reference is not the optical direct gap.
-
-Radius mismatch, mass retention and mobility loss are heuristic proxies. A consistent
-covalent-radius convention replaces mixed ionic/covalent conventions. The radius-free
-sensitivity removes both the distortion objective and radius-dependent transport penalties.
-The compatibility index is not reused to invent the activation energy.
-
-Pareto dominance uses five minimization objectives separately at each concentration:
-[FE_ML, -log10(sigma), 1-Rmu, distortion index, competing-ternary proxy].
-No weights enter dominance. The equal-scale distance to the ideal point is a transparent
-post-Pareto compromise rule, not a detected geometric knee. Near ties remain ties.
-With five acceptor candidates and five partly correlated objectives, many points can
-remain non-dominated; this does not establish a unique optimum. A 2D projection cannot
-substitute for the five-dimensional comparison.
-
-The additional dopant preference score is a separate decision rule at one declared
-concentration (default 5% sublattice substitution), not a new ML target. It combines
-formation energy (lower preferred), log10(sigma/[1 S/m]) and mobility (higher preferred).
-For each minimization cost c, U=(c_max-c)/(c_max-c_min), using complete candidates
-at that same concentration. A constant criterion has neutral utility 0.5. Missing
-positively weighted criteria make a candidate ineligible; they are never imputed.
-S=100*sum(w_j*U_j), with default weights 0.25, 0.50 and 0.25 respectively.
-These are editable application preferences, not measured physical constants.
-The positive-weight score is monotonic in its active criteria, so a strictly
-dominated point cannot outrank its dominator on those criteria. Its three-objective
-front is exported separately from the original five-objective Pareto analysis.
-The selected candidate is the maximum-score supported candidate if one exists;
-otherwise it is explicitly the exploratory score leader. Exact ties are retained.
-Scores at different concentrations use different anchors and must not be maximized
-across concentrations as if they were on a universal absolute scale.
-
-Conductivity contains mobility, so the separate mobility term intentionally gives
-additional preference to mobility. Equal weights, criterion removal and a uniform
-simplex weight sweep expose this preference dependence. Physical-scenario scores
-reuse the Pareto calculation's energy and transport draws, with fixed central
-normalization anchors and utilities clipped to 0-1. The ranges and top-choice
-shares are sensitivity diagnostics; they are not calibrated confidence intervals.
-Small energy differences relative to CV error do not establish dopant superiority.
-See score_normalization.csv and the two score sensitivity tables for all choices.
-Methodological guidance: https://doi.org/10.1787/9789264043466-en.
-
-Bootstrap energy variation is combined with empirical grouped residuals and physical
-scenario sampling. Monte Carlo frequencies and 5-95% ranges describe the chosen
-assumptions; they are not calibrated posterior probabilities or experimental error bars.
-Shared versus dopant-specific incorporation efficiency is reported separately.
-Pareto frequencies use all scenario draws as denominator; the fraction with eligible
-objective values is also reported. Never-eligible controls retain missing frequencies.
-
-Supported screening requires ML quality, a passed element-transfer tolerance, descriptor
-and concentration coverage, an experimental activation input, the declared dilute-model
-scope, and absence of a flagged process-specific phase/morphology conflict. This label
-does not mean experimentally validated. The 3% default scope is a modeling decision,
-not a universal solubility limit. High concentrations are explicitly extrapolative.
-If no candidate passes, report insufficient support instead of promoting an OOD winner.
-
-The Excel attachment is a bibliography with summaries. It is not a paired numerical
-dataset for regression or Hall validation. Reported activation inputs cannot also be
-claimed as validation successes. Published transport ranges from different processes
-must not be converted into artificial paired samples or pooled into a validation R2.
-Use the exported CSV template with measured dopant concentration, site, temperature,
-phase, process, matched UID baseline and sample-level transport for actual comparison.
-
-Selection interpretation is generated from the current scores and their sensitivity
-results. No candidate is assigned a predetermined advantage or winner label. It reports
-the numerical trade-offs against the closest alternative and the specific failed
-screening gates. Published activation inputs are provenance, not a validation success.
-
-The objective is p-type conductivity screening. Optical transmission, TFT switching,
-stability under operation, synthesis cost and toxicity are not measured here. A general
-claim of best dopant for all applications is therefore unsupported.
-
-OUTPUT GUIDE
-After extracting the ZIP, start with START_HERE.html (illustrated) or START_HERE.txt.
-01_summary/: compact dataset counts, dopant distribution, model metrics and selection.
-02_figures/: main figures and individual formation-energy plots (PNG and vector PDF).
-03_dataset/: complete filtered/raw data and chemical coverage.
-04_models/: all CV/test/transfer metrics, predictions, models and bootstrap draws.
-05_screening/: full properties, Pareto fronts, score details and scenario arrays.
-06_validation/: input templates, comparison outputs and validation status.
-07_methods_and_sources/: equations, assumptions, literature and source code.
-08_DFT_inputs_and_DOS/: optional unrelaxed structures and MP reference DOS.
-FILE_INDEX.csv and COLUMN_GUIDE.csv explain the files, columns and units.
-
-model_metrics.csv: grouped nested CV and locked-test errors, eV/atom.
-leave_one_dopant_out_metrics.csv: five-element transfer audit with MAE and RMSE; R2 is omitted.
-ml_predictions.csv: virtual energies, spread, distance and range checks.
-screening_results.csv: central physical scenarios and explicit evidence/scope flags.
-pareto_fronts.csv: fronts, eligibility and compromise ties by objective set and scope.
-robustness_results.csv: Pareto frequencies and scenario intervals, with efficiency ablations.
-requested_grid_summary.csv: descriptive averages across the requested grid, not a new score.
-external_validation_status.json: whether any sample-matched validation actually occurred.
-references.csv and literature_reference_ranges.csv: provenance; ranges are unpaired.
-raw_materials.json: reusable MP snapshot; set CONFIG['cached_raw_json'] to reuse it.
-02_figures/: PNG and vector PDF figures, with proxy/scenario labels.
-unrelaxed_DFT_starting_structures/: optional starting geometries, not calculated DFT results.
-
-CONCENTRATION AND UNITS
-The nominal screening grid contains only 1, 2, 3, 5, 10, 15 and 20% sublattice substitution.
-Five dopants at seven concentrations give 35 virtual prediction rows.
-The pristine host is retained as a training/physical reference, outside this screening grid.
-x is substitution fraction of Sn sites (Li/Na/K) or O sites (N/P).
-Substitution percent = 100*x; total-atom percent = 50*x in these ideal formulas.
-Nominal dopant density = x times host sublattice density (cm^-3).
-p is in cm^-3; mobility is in cm^2/(V s).
-sigma(S/m) = q * [p(cm^-3)*1e6] * [mu(cm^2/(V s))*1e-4] = 100*q*p*mu.
-rho(ohm m)=1/sigma(S/m); rho(ohm cm)=100/sigma(S/m). Distortion is an index, not an XRD strain percentage.
-Missing data are exported as blank/NaN and never converted to favorable zero values.
+    notes = """CALCULATION GUIDE
+Equations, logic and limitations: CALCULATION_REFERENCE.txt / calculation_basis.csv.
+Active values and bounds: calculation_parameters.csv; complete settings: run_config.json.
+Sources and input roles: references.csv and dopant_evidence_registry.csv.
+Selection reasons: selection_interpretation.txt; numerical alternatives: selected_dopant_tradeoffs.csv.
+All distributions, result tables, figures, model files and scenario arrays remain in the ZIP.
+FILE_INDEX.csv locates every output; COLUMN_GUIDE.csv defines columns and units.
+Bulk compound FE is learned; transport is a parameter scenario; generated structures are unrelaxed.
+Missing values remain NaN. Charged-defect energies and MOSFET switching are not predicted.
 """
-    interpretation_text = (out / "selection_interpretation.txt").read_text(encoding="utf-8")
-    (out / "READ_RESULTS.txt").write_text(message+"\n"+interpretation_text+"\n"+notes, encoding="utf-8")
+    (out / "READ_RESULTS.txt").write_text(message+"\n"+notes, encoding="utf-8")
     (out / "run_summary.txt").write_text(message +
         "Units: formation energy = eV/atom; conductivity = S/m; mobility = cm^2/(V s).\n"
-        "Selection is a preference-dependent screening result, not experimental confirmation.\n"
-        "See selection_interpretation.txt for the advantages, disadvantages and numerical trade-offs.\n", encoding="utf-8")
+        "Selection and transport retain their stated evidence/scenario status.\n", encoding="utf-8")
     return message
 
 
@@ -2035,6 +2028,11 @@ DISPLAY_NAMES = {
     "selected_at_reference": "Selected", "status": "Evidence status",
 }
 FILE_DESCRIPTIONS = {
+    "bulk_conductivity_all_dopants.csv": "Bulk conductivity and mobility source data for combined and individual transport figures.",
+    "NaK_conductivity_ratio_vs_concentration.csv": "Na/K central conductivity ratios and their hole-density/mobility decomposition; R=1 boundary.",
+    "transport_physics_audit.json": "Numerical-check counts and explicit DFT calculation status.",
+    "transport_physics_checks.csv": "Row-by-row transport unit and arithmetic checks; not experimental or DFT validation.",
+    "TRANSPORT_PHYSICS_AND_DFT_STATUS.txt": "Generated-geometry provenance, conductivity units and limits of quantitative interpretation.",
     "concentration_central_scores_independent.csv": "Numerical central scores at each concentration, independently normalized; exact top-score ties retained for the five candidate dopants.",
     "dataset_summary.csv": "Final data counts; distinguishes MP labels from virtual screening compositions.",
     "dopant_distribution.csv": "Five target-dopant counts, unique compositions and shares; zero coverage is retained.",
@@ -2091,6 +2089,16 @@ FILE_DESCRIPTIONS = {
     "DOS_reference_manifest.csv": "Optional MP reference DOS provenance and availability.",
     "COLUMN_GUIDE.csv": "Column names, units and descriptions for exported CSV tables.",
 }
+
+
+FILE_DESCRIPTIONS.update({
+    "property_uncertainty_at_reference.csv": "Property medians and 5–95% scenario ranges by dopant and efficiency mode, with usable-draw counts.",
+    "score_uncertainty_at_reference.csv": "Score medians and 5–95% scenario ranges using fixed central normalization anchors.",
+    "calculation_basis.csv": "Equations, decisions, rationale, limits and source/implementation mapping.",
+    "calculation_parameters.csv": "Active numerical inputs and bounds, units and source roles.",
+    "CALCULATION_REFERENCE.txt": "Readable five-equation quick guide, key active inputs and source links.",
+    "READ_RESULTS.txt": "Outcome and links to calculation logic, inputs, units and complete tables.",
+})
 
 
 def find_result_file(out, filename):
@@ -2191,7 +2199,20 @@ def organize_reader_package(out, cfg):
                           "experimental_validation.csv", "experimental_log10_MAE_by_study.csv", "dft_energy_validation.csv"},
         "07_methods_and_sources": {"READ_RESULTS.txt", "run_config.json", "references.csv", "literature_reference_ranges.csv", "dopant_evidence_registry.csv", "requirements_resolved.txt", "workflow_source.py"},
         "08_DFT_inputs_and_DOS": {"starting_structure_manifest.csv", "DOS_reference_manifest.csv"},
+        "10_sensitivity": set(),
     }
+    groups["01_summary"].update({"simple_material_counts.csv","main_dopant_results.csv","compact_summary.json",
+        "structure_counts.csv","ml_sample_counts.csv","sample_count_summary.json",
+        "COUNTS_EXPLAINED.txt","SENSITIVITY_EXPLAINED.txt"})
+    groups["05_screening"].update({"bulk_formation_energy_all_dopants.csv", "bulk_conductivity_all_dopants.csv",
+                                     "NaK_conductivity_ratio_vs_concentration.csv"})
+    groups["01_summary"].update({"transport_physics_audit.json"})
+    groups["06_validation"].add("transport_physics_checks.csv")
+    groups["07_methods_and_sources"].update({"TRANSPORT_PHYSICS_AND_DFT_STATUS.txt"})
+    groups["10_sensitivity"].add("final_selection_sensitivity.csv")
+    groups["05_screening"].update({"mc_input_draws.csv", "property_uncertainty_at_reference.csv", "score_uncertainty_at_reference.csv"})
+    groups["07_methods_and_sources"].add("SENSITIVITY_METHODS.txt")
+    groups["07_methods_and_sources"].update({"calculation_basis.csv", "calculation_parameters.csv", "CALCULATION_REFERENCE.txt"})
     for folder in groups: (out / folder).mkdir(exist_ok=True)
     for path in list(out.iterdir()):
         if not path.is_file(): continue
@@ -2209,62 +2230,13 @@ def organize_reader_package(out, cfg):
             guide.append({"table": path.relative_to(out).as_posix(), "column": column, "unit": unit, "description": meaning})
     csv_out(pd.DataFrame(guide), out / "COLUMN_GUIDE.csv")
     summary = find_result_file(out, "run_summary.txt").read_text(encoding="utf-8")
-    guide_text = ("DOPED SnO RESULTS — START HERE\n\n" + summary +
-        "\nOpen START_HERE.html in a browser after extracting the complete ZIP.\n"
-        "01_summary: counts, GB metrics, independently normalized concentration-score table, selected dopant and interpretation.\n"
-        "02_figures: PNG + vector PDF; formation_energy_by_dopant contains each dopant separately.\n"
-        "03_dataset: complete filtered and raw Materials Project dataset.\n"
-        "04_models: detailed cross-validation/test/transfer results and fitted models.\n"
-        "05_screening: all property curves, scores, Pareto fronts and uncertainty draws.\n"
-        "06_validation: experimental/DFT input templates and validation status.\n"
-        "07_methods_and_sources: full interpretation, equations, assumptions and references.\n"
-        "08_DFT_inputs_and_DOS: optional unrelaxed starting structures and reference DOS.\n\n"
-        "FILE_INDEX.csv describes exported files; COLUMN_GUIDE.csv gives column meanings and units.\n"
-        "All large tables are complete in these folders; they are not printed in Colab.\n"
-        "Blank/NaN means missing or ineligible, not zero. Formation energy is a compound-energy proxy.\n"
-        "The score is a preference-dependent screening decision at the reported concentration.\n")
-    (out / "START_HERE.txt").write_text(guide_text, encoding="utf-8")
-    style = """body{font:15px/1.55 system-ui,sans-serif;color:#1b3043;background:#f5f8fb;margin:0}
-    main{max-width:1250px;margin:auto;padding:30px}h1,h2{color:#163e5b}h2{margin-top:34px}
-    section{background:white;border:1px solid #dde6ef;border-radius:10px;padding:18px;margin:18px 0}
-    table{border-collapse:collapse;width:100%;font-size:13px}td,th{padding:8px;text-align:left;border-bottom:1px solid #e1e8ee}
-    th{background:#edf3f8}tr:nth-child(even){background:#f8fafc}a{color:#125c97}
-    pre{white-space:pre-wrap;font:inherit}img{width:100%;height:auto}nav a{margin-right:18px}
-    .scroll{overflow-x:auto}.note{border-left:4px solid #c18c31;padding-left:15px}"""
-    body = ["<h1>Doped SnO: results and dopant selection</h1>",
-            '<nav><a href="#summary">Summaries</a><a href="#figures">Figures</a><a href="#files">All files</a></nav>',
-            f'<section><pre>{escape(summary)}</pre></section>',
-            '<p class="note">The selected dopant is a screening candidate under the stated weights and physical assumptions. '
-            'A score is not experimental confirmation. Read its evidence status before interpreting the ranking.</p>',
-            '<h2 id="summary">Compact result tables</h2>']
-    interpretation = json.loads(find_result_file(out, "selection_interpretation.json").read_text(encoding="utf-8"))
-    body.append('<section>'+selection_interpretation_html(interpretation)+'</section>')
-    for stem in SUMMARY_TABLES:
-        path = find_result_file(out, f"{stem}.csv")
-        frame = pd.read_csv(path)
-        body.append(f'<section><h3>{escape(TABLE_TITLES[stem])}</h3><div class="scroll">{compact_table_html(frame)}</div>'
-                    f'<p><a href="{path.relative_to(out).as_posix()}">Complete CSV</a></p></section>')
-    weights = cfg["score_weights"]
-    total = sum(weights.values())
-    body.append('<h2>How the score selects a candidate</h2><section><p>At ' + f'{cfg["score_reference_pct"]:g}% sublattice substitution, '
-        'each criterion is scaled from 0 (least favorable) to 1 (most favorable) among complete alternatives. '
-        'Lower compound formation energy, higher log conductivity and higher mobility are preferred.</p><p>Score = 100 × (' +
-        " + ".join(f'{weights[k]/total:g} × U({k.replace("_", " ")})' for k in SCORE_KEYS) + ').</p>'
-        '<p>These are editable preference weights. Conductivity includes mobility, so giving mobility its own weight deliberately adds preference to it. '
-        'Weight changes, criterion removal and physical uncertainty are reported in 05_screening. The existing five-objective Pareto analysis remains available.</p>'
-        '<p>Selection uses the highest score among candidates passing the evidence/applicability gates if any exist; otherwise it reports an exploratory leader. '
-        'Exact score ties are retained. Scores normalized at different concentrations are not an absolute scale for concentration optimization.</p>'
-        '<p>Method guidance: <a href="https://doi.org/10.1787/9789264043466-en">OECD/JRC composite-indicator handbook</a>. '
-        '<a href="https://scikit-learn.org/stable/modules/generated/sklearn.metrics.r2_score.html">R² definition</a>: '
-        '1 − residual sum of squares / total sum of squares. Pooled CV R² is calculated from all outer-fold predictions, not by averaging fold R².</p></section>')
-    body.append('<p>The concentration-score line graph and numerical heatmap use independent normalization at each concentration. '
-                'Stars and gold outlines identify the highest central scores; final selection still uses the configured reference and screening gates.</p>')
-    body.append('<h2 id="figures">Main figures</h2>')
-    for path in sorted((out / "02_figures").glob("*.png")):
-        rel = path.relative_to(out).as_posix()
-        body.append(f'<section><h3>{escape(path.stem.replace("_", " "))}</h3><img loading="lazy" src="{rel}" '
-                    f'alt="{escape(path.stem)}"><p><a href="{path.with_suffix(".pdf").relative_to(out).as_posix()}">Vector PDF</a></p></section>')
-    body.append('<h2 id="files">Complete data and supporting files</h2><p>No rows are omitted from the exported CSV files.</p>')
+    (out / "START_HERE.txt").write_text(
+        "SnO RESULTS\n" + summary +
+        "\nOpen START_HERE.html for essential results; expand the short equation guide for key inputs and sources.\n"
+        "FULL_REPORT.html retains every main figure and links all files.\n"
+        "FILE_INDEX.csv lists complete tables/arrays; COLUMN_GUIDE.csv defines columns and units.\n"
+        "Calculation reference: 07_methods_and_sources/CALCULATION_REFERENCE.txt.\n",
+        encoding="utf-8")
     index = []
     for path in sorted(out.rglob("*")):
         if not path.is_file(): continue
@@ -2278,64 +2250,8 @@ def organize_reader_package(out, cfg):
             except pd.errors.EmptyDataError: nrows, ncols = 0, 0
         index.append({"relative_path": rel, "description": desc, "rows": nrows, "columns": ncols})
     csv_out(pd.DataFrame(index), out / "FILE_INDEX.csv")
-    body.append('<p><a href="FILE_INDEX.csv">File index (CSV)</a> · <a href="COLUMN_GUIDE.csv">Column and unit guide (CSV)</a></p>')
-    for folder in [*groups.keys(), "02_figures"]:
-        items = [r for r in index if r["relative_path"].startswith(folder+"/")]
-        if not items: continue
-        body.append(f'<section><h3>{escape(folder)}</h3><ul>')
-        for row in items:
-            body.append(f'<li><a href="{escape(row["relative_path"], quote=True)}">{escape(Path(row["relative_path"]).name)}</a> '
-                        f'— {escape(row["description"])}</li>')
-        body.append('</ul></section>')
-    html = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
-    html += '<title>Doped SnO results</title><style>'+style+'</style></head><body><main>'+"\n".join(body)+'</main></body></html>'
-    (out / "START_HERE.html").write_text(html, encoding="utf-8")
 
 
-def display_inline_results(out, cfg, tables=None):
-    """Only compact summaries and main figures; complete tables stay in the ZIP."""
-    from html import escape
-    out = Path(out)
-    tables = load_result_tables(out) if tables is None else tables
-    if not cfg.get("display_results_inline", True): return tables
-    rich = False
-    try:
-        from IPython import get_ipython
-        from IPython.display import display, HTML, Image
-        rich = get_ipython() is not None
-    except ImportError: pass
-    summary = find_result_file(out, "run_summary.txt").read_text(encoding="utf-8")
-    if rich: display(HTML('<h2>SnO screening results</h2><pre style="white-space:pre-wrap">'+escape(summary)+'</pre>'))
-    else: print("\n"+summary)
-    interpretation = json.loads(find_result_file(out, "selection_interpretation.json").read_text(encoding="utf-8"))
-    if rich: display(HTML(selection_interpretation_html(interpretation)))
-    else: print(find_result_file(out, "selection_interpretation.txt").read_text(encoding="utf-8"))
-    if cfg.get("display_tables_inline", True):
-        for stem in SUMMARY_TABLES:
-            if stem not in tables: continue
-            frame = tables[stem]
-            if len(frame) > cfg.get("inline_max_table_rows", 12):
-                print(f"{TABLE_TITLES[stem]}: {len(frame)} rows; complete table is in the ZIP.")
-                continue
-            if rich:
-                display(HTML('<style>.sno-compact table{border-collapse:collapse;font-size:12px;color:#193047;background:white;}'
-                    '.sno-compact td,.sno-compact th{padding:7px 9px;border-bottom:1px solid #e1e8ee;white-space:nowrap}'
-                    '.sno-compact th{background:#edf3f8}</style><h3>'+escape(TABLE_TITLES[stem])+ '</h3>'
-                    f'<div class="sno-compact" style="max-height:{int(cfg.get("inline_table_height_px",360))}px;overflow:auto">'
-                    +compact_table_html(frame)+'</div>'))
-            else:
-                print("\n"+TABLE_TITLES[stem])
-                print(frame.rename(columns=DISPLAY_NAMES).to_string(index=False, float_format=lambda v: f"{v:.4g}"))
-    if cfg.get("display_figures_inline", True):
-        folder = out / "02_figures" if (out / "02_figures").exists() else out / "figures"
-        for path in sorted(folder.glob("*.png")):
-            if rich: display(Image(filename=str(path), width=int(cfg.get("inline_figure_width_px", 1000))))
-            else: print("Figure:", path)
-    note = ("Complete tables, individual dopant plots and methods are in the ZIP. Extract it and open START_HERE.html.\n"
-            'To inspect a full table without retraining: display(RESULT_TABLES["screening_results"]).')
-    if rich: display(HTML('<p>'+escape(note).replace('\n','<br>')+'</p>'))
-    else: print(note)
-    return tables
 
 
 def export_workflow_source(out):
@@ -2356,10 +2272,1245 @@ def export_workflow_source(out):
         (Path(out) / "workflow_source.py").write_text(text, encoding="utf-8")
 
 
+# =================== INTEGRATED Na/K SENSITIVITY ===========================
+def pair_summary(a, b, atol=1e-10):
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    if a.shape != b.shape or not a.size:
+        raise ValueError("Pairwise arrays must have matching nonempty shapes.")
+    valid = np.isfinite(a)&np.isfinite(b)
+    diff = a-b
+    tie = valid & np.isclose(diff, 0., atol=atol, rtol=0)
+    return dict(total_draws=len(diff), paired_valid_draws=int(valid.sum()),
+        excluded_draws=int((~valid).sum()),
+        Na_win_fraction_all_draws=float((valid&(diff>0)&~tie).mean()),
+        K_win_fraction_all_draws=float((valid&(diff<0)&~tie).mean()),
+        tie_fraction_all_draws=float(tie.mean()))
+
+
+def sensitivity_variants(cfg):
+    full = validate_score_config(cfg)
+    variants = {"Full score": full, "Conductivity only": np.array([0.,1.,0.]),
+                "Mobility only": np.array([0.,0.,1.])}
+    for name, remove in [("Without extra mobility", 2)]:
+        w = full.copy()
+        w[remove] = 0
+        if w.sum() > 0:
+            variants[name] = w/w.sum()
+    return variants
+
+
+def run_integrated_sensitivity(screen, saved, cfg, out):
+    """The attached sensitivity analysis integrated without re-upload or hardcoded weights."""
+    folder = out / "10_sensitivity"
+    folder.mkdir()
+    variants = sensitivity_variants(cfg)
+    central, points, preferences, anchors_rows, contexts = [], [], [], [], {}
+    rng = np.random.default_rng(cfg["seed"]+505)
+    for pct in cfg["sensitivity_concentrations"]:
+        frame = screen[np.isclose(screen.substitution_pct, pct, rtol=0, atol=1e-9)].copy().reset_index(drop=True)
+        if frame.empty or frame.dopant.duplicated().any() or not {"Na","K"} <= set(frame.dopant):
+            raise ValueError(f"Sensitivity requires unique Na/K rows at {pct}%.")
+        ids = {d: int(np.flatnonzero(frame.dopant.to_numpy()==d)[0]) for d in ["Na","K"]}
+        costs = score_costs(frame)
+        utility, full_scores, _, anchors = normalized_desirability(costs, variants["Full score"])
+        contexts[pct] = frame, ids, anchors
+        for d in ids:
+            old = saved[(saved.dopant==d)&np.isclose(saved.substitution_pct, pct)]
+            if len(old) != 1 or not np.isclose(full_scores[ids[d]], old.score_0_100.iloc[0],
+                                               atol=1e-7, rtol=0, equal_nan=True):
+                raise ValueError("Integrated sensitivity full score does not reproduce base score.")
+        for j, criterion in enumerate(SCORE_KEYS):
+            n = 100*utility[ids["Na"],j]*variants["Full score"][j]
+            k = 100*utility[ids["K"],j]*variants["Full score"][j]
+            points.append(dict(substitution_pct=pct, criterion=criterion, Na_points=n,
+                               K_points=k, K_minus_Na_points=k-n))
+            anchors_rows.append(dict(substitution_pct=pct, criterion=criterion,
+                                    cost_min=anchors[0][j], cost_max=anchors[1][j]))
+        for name, weights in variants.items():
+            _, values, _, _ = normalized_desirability(costs, weights, anchors=anchors)
+            na, k = values[ids["Na"]], values[ids["K"]]
+            leader = ("Invalid" if not np.isfinite([na,k]).all() else "Tie"
+                      if np.isclose(na,k,atol=1e-10,rtol=0) else "Na" if na>k else "K")
+            central.append(dict(substitution_pct=pct, variant=name, Na_score=na, K_score=k,
+                                K_minus_Na=k-na, pairwise_leader=leader))
+        for name in ["Full score"]:
+            transport_w = rng.dirichlet(np.ones(2), size=cfg["score_weight_draws"])
+            w = np.column_stack([np.zeros(len(transport_w)), transport_w])
+            values = np.array([normalized_desirability(costs, one, anchors=anchors)[1] for one in w])
+            preferences.append(dict(substitution_pct=pct, variant=name,
+                **pair_summary(values[:,ids["Na"]],values[:,ids["K"]])))
+    central, points = pd.DataFrame(central), pd.DataFrame(points)
+    csv_out(central, folder/"central_score_ablations.csv")
+    csv_out(points, folder/"score_contribution_comparison.csv")
+    csv_out(pd.DataFrame(preferences), folder/"pairwise_weight_sensitivity.csv")
+    csv_out(pd.DataFrame(anchors_rows), folder/"central_score_anchors.csv")
+    fig, axes = plt.subplots(1, len(contexts), figsize=(6*len(contexts),4.5), squeeze=False, layout="constrained")
+    for ax, pct in zip(axes[0], contexts):
+        p = points[points.substitution_pct==pct]
+        ax.barh(p.criterion, p.K_minus_Na_points,
+                color=["#4775a3" if v>=0 else "#b26741" for v in p.K_minus_Na_points])
+        ax.axvline(0,color="black",lw=1)
+        ax.set(title=f"{pct:g}% substitution",xlabel="K minus Na contribution (points)")
+        for spine in ax.spines.values():
+            spine.set_visible(True)
+    save_figure(fig, out/"figures"/"17_NaK_score_contribution")
+    inputs = pd.read_csv(out/"mc_input_draws.csv")
+    metrics, corrs, importance, heldout, uncertainty, targets_all = [], [], [], [], [], []
+    with np.load(out/"mc_scenario_draws.npz", allow_pickle=False) as mc:
+        modes = mc["efficiency_mode"].astype(str)
+        n = len(modes)
+        if not np.array_equal(inputs.draw_id, np.arange(n)) or not np.array_equal(inputs.efficiency_mode, modes):
+            raise ValueError("Monte Carlo input rows and output draws are misaligned.")
+        for pct, (frame, ids, anchors) in contexts.items():
+            indexes = []
+            for d in frame.dopant:
+                matches = np.flatnonzero((mc["dopants"]==d)&np.isclose(mc["substitution_pct"],pct,rtol=0,atol=1e-9))
+                if len(matches)!=1:
+                    raise ValueError("Missing/duplicate Monte Carlo composition.")
+                indexes.append(int(matches[0]))
+            fe, sigma, mu = mc["FE_eV_atom"][:,indexes], mc["sigma_S_m"][:,indexes], mc["mu_cm2_Vs"][:,indexes]
+            scores = {v: [] for v in variants}
+            for e,s,m in zip(fe,sigma,mu):
+                with np.errstate(divide="ignore",invalid="ignore"):
+                    costs = np.column_stack([e,-np.log10(s),-m])
+                for v,w in variants.items():
+                    scores[v].append(normalized_desirability(costs,w,anchors=anchors)[1])
+            scores = {v:np.asarray(a) for v,a in scores.items()}
+            na,k = ids["Na"],ids["K"]
+            targets = pd.DataFrame(dict(draw_id=np.arange(n), efficiency_mode=modes,
+                                       substitution_pct=pct, delta_sigma_S_m=sigma[:,na]-sigma[:,k]))
+            with np.errstate(divide="ignore",invalid="ignore"):
+                targets["log10_sigma_ratio_Na_K"] = np.log10(sigma[:,na])-np.log10(sigma[:,k])
+            targets["delta_full_score"] = scores["Full score"][:,na]-scores["Full score"][:,k]
+            if "Without energy" in scores:
+                targets["delta_no_energy_score"] = scores["Without energy"][:,na]-scores["Without energy"][:,k]
+            targets_all.append(targets)
+            for mode in sorted(set(modes)):
+                mask = modes==mode
+                for variant,a in scores.items():
+                    uncertainty.append(dict(substitution_pct=pct,efficiency_mode=mode,variant=variant,
+                                            **pair_summary(a[mask,na],a[mask,k])))
+                # The removed mass penalty is not an input to simplified mobility.
+                X = inputs.loc[mask,["p0_cm3","mu0_cm2_Vs","m_dos_over_me","compensation_fraction",
+                    "alloy_scattering","ion_scattering","EA_Na_eV","EA_K_eV"]].copy()
+                if mode=="shared_efficiency":
+                    if not np.allclose(inputs.loc[mask,"efficiency_Na"],inputs.loc[mask,"efficiency_K"]):
+                        raise ValueError("Shared efficiencies differ.")
+                    X["eta_shared"] = inputs.loc[mask,"efficiency_Na"]
+                elif mode=="dopant_specific_efficiency":
+                    X["eta_Na"],X["eta_K"] = inputs.loc[mask,"efficiency_Na"],inputs.loc[mask,"efficiency_K"]
+                else:
+                    raise ValueError("Unknown efficiency mode.")
+                for c in ["p0_cm3"]+[c for c in X if c.startswith("eta_")]:
+                    if not (X[c]>0).all():
+                        raise ValueError("Nonpositive logarithmic predictor.")
+                    X["log10_"+c] = np.log10(X.pop(c))
+                for target_name in [c for c in targets if c.startswith(("delta_","log10_"))]:
+                    predictors = X.copy()
+                    y = targets.loc[mask,target_name]
+                    valid = np.isfinite(predictors).all(axis=1)&np.isfinite(y)
+                    xv,yv = predictors.loc[valid],y.loc[valid]
+                    xv = xv.loc[:,xv.nunique()>1]
+                    if len(yv)<100 or np.std(yv)<1e-12 or xv.empty:
+                        metrics.append(dict(substitution_pct=pct, efficiency_mode=mode,target=target_name,
+                                            status="skipped_insufficient_or_constant",importance_interpretable=False))
+                        continue
+                    tr,te = train_test_split(np.arange(len(yv)),test_size=.30,random_state=cfg["seed"])
+                    model = GradientBoostingRegressor(n_estimators=250,learning_rate=.05,
+                        max_depth=3,min_samples_leaf=5,random_state=cfg["seed"])
+                    model.fit(xv.iloc[tr],yv.iloc[tr])
+                    pred = model.predict(xv.iloc[te])
+                    r2,mae = r2_score(yv.iloc[te],pred),mean_absolute_error(yv.iloc[te],pred)
+                    baseline = mean_absolute_error(yv.iloc[te],np.full(len(te),np.median(yv.iloc[tr])))
+                    accepted = bool(r2>=cfg["sensitivity_min_R2"] and mae<baseline)
+                    metrics.append(dict(substitution_pct=pct,efficiency_mode=mode,target=target_name,status="evaluated",
+                        n_train=len(tr),n_test=len(te),holdout_R2=r2,holdout_MAE=mae,
+                        median_baseline_MAE=baseline,importance_interpretable=accepted))
+                    heldout.extend(dict(substitution_pct=pct,efficiency_mode=mode,target=target_name,
+                        draw_id=int(i),actual=a,predicted=b) for i,a,b in zip(yv.iloc[te].index,yv.iloc[te],pred))
+                    for c in xv:
+                        corrs.append(dict(substitution_pct=pct,efficiency_mode=mode,target=target_name,
+                            feature=c,spearman_rho=spearmanr(xv[c],yv).statistic))
+                    pi = permutation_importance(model,xv.iloc[te],yv.iloc[te],scoring="r2",
+                        n_repeats=cfg["sensitivity_permutation_repeats"],random_state=cfg["seed"],n_jobs=1)
+                    for j,c in enumerate(xv):
+                        importance.append(dict(substitution_pct=pct,efficiency_mode=mode,target=target_name,
+                            feature=c,mean_R2_decrease=pi.importances_mean[j],shuffle_SD=pi.importances_std[j],
+                            importance_interpretable=accepted))
+    csv_out(pd.DataFrame(uncertainty),folder/"pairwise_MC_score_sensitivity.csv")
+    csv_out(pd.concat(targets_all,ignore_index=True),folder/"NaK_MC_targets.csv")
+    for name, records in [("surrogate_holdout_metrics",metrics),("spearman_input_associations",corrs),
+                          ("heldout_permutation_importance",importance),("surrogate_holdout_predictions",heldout)]:
+        csv_out(pd.DataFrame(records),folder/f"{name}.csv")
+    (folder/"READ_INTERPRETATION.txt").write_text(
+        "K-minus-Na contributions favor K when positive; ML difference targets favor Na when positive.\n"
+        "Na/K pairwise comparisons are not overall wins over all five dopants.\n"
+        "Each concentration has independent anchors; scores do not establish an optimum concentration.\n"
+        "All ablations and Monte Carlo scores retain the central full-score anchors.\n"
+        "Uniform simplex weights describe preferences, not experimental probabilities.\n"
+        "Invalid pairs stay in the denominator; reported win fractions may sum to less than one.\n"
+        "Surrogates explain simulated outputs, not measured material physics.\n"
+        "Interpret permutation importance only if importance_interpretable=True; shuffle SD is not a confidence interval.\n"
+        "Ranges describe the declared parameter scenarios, not calibrated confidence bounds.\n",
+        encoding="utf-8")
+    print("Integrated Na/K sensitivity finished; no result re-upload required.")
+    return central
+
+
+def validate_extensions(cfg):
+    """Validate the retained concentration and sensitivity settings."""
+    grid = np.asarray(cfg["requested_pareto_pct"], float)
+    points = np.asarray(cfg["sensitivity_concentrations"], float)
+    if (points.ndim != 1 or not len(points) or not np.isfinite(points).all()
+            or len(np.unique(points)) != len(points)):
+        raise ValueError("Sensitivity concentrations must be unique finite values.")
+    if any(not np.any(np.isclose(grid, v, rtol=0, atol=1e-9)) for v in points):
+        raise ValueError("Every sensitivity concentration must occur in requested_pareto_pct.")
+    if not np.isfinite(cfg["sensitivity_min_R2"]):
+        raise ValueError("sensitivity_min_R2 must be finite.")
+    if int(cfg["sensitivity_permutation_repeats"]) < 1:
+        raise ValueError("At least one permutation repeat is required.")
+
+
+def write_extension_notes(out, cfg):
+    text = (
+        "SnO SENSITIVITY AND UNCERTAINTY\n"
+        "Shared and dopant-specific activation-efficiency modes are reported separately.\n"
+        "All-dopant selections and Na/K pairwise comparisons answer different questions.\n"
+        "Property plots reuse the paired Monte Carlo samples from mc_scenario_draws.npz.\n"
+        "Score intervals reuse score_scenario_draws.npz, with the central normalization anchors fixed.\n"
+        "Intervals span the 5th to 95th percentile of finite, usable draws.\n"
+        "Figure 07 retains the original concentration-dependent conductivity bands, pooling both modes.\n"
+        "Figures 24 and 25 show the reference concentration with efficiency modes separated.\n"
+        "Central estimates are plotted separately and need not equal the scenario median.\n"
+        "Valid-draw counts and fractions are exported; unavailable intervals remain missing.\n"
+        "These are sensitivity ranges under declared assumptions, not calibrated confidence intervals.\n"
+        "Full equations, sampling rules and inputs: calculation_basis.csv and calculation_parameters.csv.\n"
+    )
+    (out / "SENSITIVITY_METHODS.txt").write_text(text, encoding="utf-8")
+
+
+def selection_sensitivity_all_dopants(screen, cfg, out):
+    """All-five-dopant selection robustness, with efficiency assumptions separate.
+
+    Keep the central eligible pool and anchors fixed. Invalid draws remain in
+    the denominator; tied top candidates share one win. No success probability
+    or calibrated uncertainty interval is implied.
+    """
+    pct=float(cfg["score_reference_pct"])
+    rows=[]
+    ref=pd.read_csv(out/"dopant_score_details.csv").set_index("dopant").reindex(DOPANTS)
+    central=screen[np.isclose(screen.substitution_pct,pct)].set_index("dopant").reindex(DOPANTS).reset_index()
+    weights=validate_score_config(cfg)
+    _,_,_,anchors=normalized_desirability(score_costs(central),weights)
+    pool=ref.selection_pool.to_numpy(bool)
+    def record(experiment,shares,n,valid_fraction):
+        for j,d in enumerate(DOPANTS):
+            rows.append(dict(substitution_pct=pct,dopant=d,experiment=experiment,
+                top_share=float(shares[j]),draws=int(n),valid_draw_fraction=float(valid_fraction[j]),
+                interpretation="fractional sensitivity wins / all draws; not a physical probability"))
+    record("preference_weights",ref.weight_sweep_top_share.fillna(0).to_numpy(),
+           cfg["score_weight_draws"],ref.selection_pool.to_numpy(float))
+    with np.load(out/"mc_scenario_draws.npz",allow_pickle=False) as mc:
+        indices=[]
+        for d in DOPANTS:
+            hits=np.flatnonzero((mc["dopants"]==d)&np.isclose(mc["substitution_pct"],pct))
+            if len(hits)!=1: raise ValueError("Bulk sensitivity alignment failure.")
+            indices.append(int(hits[0]))
+        for mode in sorted(set(mc["efficiency_mode"])):
+            mask=mc["efficiency_mode"]==mode
+            wins=[]; eligibility=[]
+            for e,g,m in zip(mc["FE_eV_atom"][mask][:,indices],mc["sigma_S_m"][mask][:,indices],mc["mu_cm2_Vs"][mask][:,indices]):
+                with np.errstate(divide="ignore",invalid="ignore"):
+                    cost=np.column_stack([e,-np.log10(g),-m])
+                _,values,valid,_=normalized_desirability(cost,weights,anchors=anchors)
+                wins.append(winner_shares(values,pool));eligibility.append(valid & pool)
+            record(str(mode),np.mean(wins,axis=0),int(mask.sum()),np.mean(eligibility,axis=0))
+    table=pd.DataFrame(rows);csv_out(table,out/"final_selection_sensitivity.csv")
+    plot_clear_selection_sensitivity(table, cfg, out)
+    return table
+
+
+def plot_bulk_conductivity_all_dopants(screen, cfg, out):
+    """Show central bulk conductivity and mobility together, without refitting.
+
+    Preserve the old figure name and all old CSV fields; add an accessible
+    mobility-only companion for narrow journal figure columns. No physics or
+    scenario values are recalculated for visualization.
+    """
+    columns = ["dopant", "site", "substitution_pct", "p_scenario_cm3",
+               "mu_scenario_cm2_Vs", "sigma_scenario_S_m", "rho_scenario_ohm_m",
+               "hole_only_model_valid", "within_dilute_model_scope"]
+    data = screen[columns].copy()
+    if data.duplicated(["dopant", "substitution_pct"]).any():
+        raise ValueError("Duplicate dopant/concentration rows in the bulk transport plot.")
+    grid = np.sort(np.asarray(cfg["requested_pareto_pct"], dtype=float))
+    for dopant in DOPANTS:
+        values = np.sort(data.loc[data.dopant.eq(dopant), "substitution_pct"].to_numpy(float))
+        if len(values) != len(grid) or not np.allclose(values, grid):
+            raise ValueError(f"Incomplete conductivity/mobility grid for {dopant}.")
+    data["transport_basis"] = "bulk_parameter_scenario_q_p_mu_not_DFT_or_measurement"
+    csv_out(data, out / "bulk_conductivity_all_dopants.csv")
+    folder = out / "figures"
+    folder.mkdir(exist_ok=True)
+
+    def draw_property(ax, property_name, ylabel, log_scale=False):
+        for dopant in DOPANTS:
+            part = data.loc[data.dopant.eq(dopant)].sort_values("substitution_pct")
+            values = part[property_name].to_numpy(float)
+            valid = np.isfinite(values) & (values > 0)
+            if property_name == "sigma_scenario_S_m":
+                valid &= part.hole_only_model_valid.to_numpy(bool)
+            ax.plot(part.substitution_pct, np.where(valid, values, np.nan),
+                    marker="o", color=COLORS[dopant], label=dopant,
+                    lw=2.3, ms=6.5)
+        ax.set_xlabel("Sublattice substitution (%)")
+        ax.set_ylabel(ylabel)
+        set_substitution_axis(ax, cfg)
+        if len(grid) == 1:
+            ax.set_xlim(grid[0] - .5, grid[0] + .5)
+        if log_scale:
+            ax.set_yscale("log")
+        ax.grid(axis="y", alpha=.18)
+        ax.set_axisbelow(True)
+
+    fig, axes = plt.subplots(1, 2, figsize=(15.0, 6.3))
+    fig.subplots_adjust(left=.085, right=.98, top=.83, bottom=.18, wspace=.28)
+    draw_property(axes[0], "sigma_scenario_S_m", "Conductivity (S/m)", True)
+    draw_property(axes[1], "mu_scenario_cm2_Vs", r"Mobility (cm$^2$/(V s))")
+    axes[0].set_title("(a) Conductivity")
+    axes[1].set_title("(b) Mobility")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncols=len(DOPANTS),
+               bbox_to_anchor=(.53, .925), frameon=False, fontsize=12)
+    fig.suptitle(f"Bulk SnO transport at {cfg['temperature_K']:g} K",
+                 fontsize=18, y=.995)
+    fig.text(.5, .055, f"Central model scenarios; concentrations above {cfg['dilute_screening_limit_pct']:g}% are exploratory.",
+             ha="center", fontsize=10.5)
+    save_figure(fig, folder / "23_bulk_conductivity_all_dopants")
+
+    # Same mobility data, exported alone to allow a large, legible journal panel.
+    fig, ax = plt.subplots(figsize=(10.3, 6.2))
+    fig.subplots_adjust(left=.13, right=.97, top=.82, bottom=.18)
+    draw_property(ax, "mu_scenario_cm2_Vs", r"Mobility (cm$^2$/(V s))")
+    ax.legend(ncols=len(DOPANTS), frameon=False, loc="lower center",
+              bbox_to_anchor=(.5, 1.01), fontsize=11)
+    ax.set_title(f"Bulk SnO mobility at {cfg['temperature_K']:g} K", pad=24)
+    save_figure(fig, folder / "26_bulk_mobility_all_dopants")
+
+
+def plot_na_k_conductivity_ratio(screen, cfg, out):
+    """Directly compare Na and K using R_sigma = (p_Na/p_K)*(mu_Na/mu_K).
+
+    Input curves are exactly the current central transport results. The ratio
+    is never based on separately normalized dopant preference scores. Invalid
+    hole-only scenarios remain missing rather than being plotted as zero.
+    """
+    fields = ["substitution_pct", "p_scenario_cm3", "mu_scenario_cm2_Vs",
+              "sigma_scenario_S_m", "hole_only_model_valid"]
+    na = screen.loc[screen.dopant.eq("Na"), fields]
+    k = screen.loc[screen.dopant.eq("K"), fields]
+    if na.substitution_pct.duplicated().any() or k.substitution_pct.duplicated().any():
+        raise ValueError("Na/K ratio requires one point per dopant per concentration.")
+    pairs = na.merge(k, on="substitution_pct", how="outer", validate="one_to_one",
+                     suffixes=("_Na", "_K"), indicator=True)
+    if not pairs._merge.eq("both").all():
+        raise ValueError("Na and K must have matching substitution concentrations.")
+    pairs = pairs.drop(columns="_merge").sort_values("substitution_pct").reset_index(drop=True)
+    concentration = np.asarray(cfg["requested_pareto_pct"], float)
+    if len(pairs) != len(concentration) or not np.allclose(np.sort(concentration), pairs.substitution_pct):
+        raise ValueError("Na/K ratio points do not match the configured concentration grid.")
+    valid = pairs.hole_only_model_valid_Na.astype(bool) & pairs.hole_only_model_valid_K.astype(bool)
+    for field in ["p_scenario_cm3", "mu_scenario_cm2_Vs", "sigma_scenario_S_m"]:
+        valid &= np.isfinite(pairs[field + "_Na"]) & (pairs[field + "_Na"] > 0)
+        valid &= np.isfinite(pairs[field + "_K"]) & (pairs[field + "_K"] > 0)
+    ratio = np.full(len(pairs), np.nan)
+    hole_ratio = np.full(len(pairs), np.nan)
+    mobility_ratio = np.full(len(pairs), np.nan)
+    ratio[valid] = (pairs.loc[valid, "sigma_scenario_S_m_Na"] /
+                    pairs.loc[valid, "sigma_scenario_S_m_K"])
+    hole_ratio[valid] = (pairs.loc[valid, "p_scenario_cm3_Na"] /
+                         pairs.loc[valid, "p_scenario_cm3_K"])
+    mobility_ratio[valid] = (pairs.loc[valid, "mu_scenario_cm2_Vs_Na"] /
+                             pairs.loc[valid, "mu_scenario_cm2_Vs_K"])
+    if not np.allclose(ratio[valid], hole_ratio[valid] * mobility_ratio[valid],
+                       rtol=1e-10, atol=0.0):
+        raise AssertionError("Na/K ratio failed the physical sigma = q*p*mu identity.")
+    pairs["ratio_conductivity_Na_over_K"] = ratio
+    pairs["ratio_hole_density_Na_over_K"] = hole_ratio
+    pairs["ratio_mobility_Na_over_K"] = mobility_ratio
+    pairs["ratio_identity_check"] = hole_ratio * mobility_ratio
+    pairs["higher_central_conductivity"] = np.where(~valid, "invalid",
+        np.where(np.isclose(ratio, 1, rtol=0, atol=1e-10), "equal",
+                 np.where(ratio > 1, "Na", "K")))
+    pairs["model_basis"] = "central_transport_scenario_not_experimental_validation"
+    csv_out(pairs, out / "NaK_conductivity_ratio_vs_concentration.csv")
+
+    fig, ax = plt.subplots(figsize=(10.4, 6.6))
+    fig.subplots_adjust(left=.13, right=.97, top=.87, bottom=.17)
+    ax.plot(pairs.substitution_pct, ratio, "o-", color="#245D83", lw=2.5,
+            ms=8, label=r"$R_{\sigma}=\sigma_{Na}/\sigma_K$")
+    ax.axhline(1.0, color="#B45309", linestyle="--", linewidth=1.8,
+               label=r"$R_{\sigma}=1$ (equal conductivity)")
+    set_substitution_axis(ax, cfg)
+    finite = ratio[np.isfinite(ratio)]
+    if len(finite):
+        lo = min(float(finite.min()), 1.0)
+        hi = max(float(finite.max()), 1.0)
+        pad = max(.025, (hi - lo) * .23)
+        ax.set_ylim(max(0, lo - pad), hi + pad)
+    if len(concentration) == 1:
+        ax.set_xlim(concentration[0]-.5, concentration[0]+.5)
+    ax.set(xlabel="Sn-site substitution (%)",
+           ylabel=r"Na/K conductivity ratio, $R_{\sigma}$",
+           title="Na/K conductivity ratio versus concentration")
+    ax.grid(axis="y", alpha=.18)
+    ax.legend(loc="best", frameon=False)
+    fig.text(.5, .06, r"$R_{\sigma}>1$: Na higher; $R_{\sigma}<1$: K higher. Central model estimates only.",
+             ha="center", fontsize=11)
+    save_figure(fig, Path(out) / "figures" / "27_NaK_conductivity_ratio")
+    return pairs
+
+
+def write_transport_physics_audit(screen, cfg, out):
+    """Check numerical identities; do not label algebra checks as material validation."""
+    rows = []
+    rtol, atol = 1e-10, 0.0  # Keep the original strict identity tolerance.
+
+    def check(frame, reported, expected, domain, name, unit, valid_column=None):
+        actual = frame[reported].to_numpy(float)
+        expected = np.broadcast_to(np.asarray(expected, dtype=float), actual.shape)
+        valid = (frame[valid_column].to_numpy(bool) if valid_column else
+                 np.ones(len(frame), dtype=bool))
+        finite = np.isfinite(actual) & np.isfinite(expected)
+        matched = finite & np.isclose(actual, expected, rtol=rtol, atol=atol)
+        # A physically rejected row remains explicitly unevaluated.
+        status = np.where(~valid, "not_evaluated_invalid_hole_only_scenario",
+                          np.where(matched, "pass", "fail"))
+        denominator = np.maximum(np.abs(expected), np.finfo(float).tiny)
+        error = np.where(finite, np.abs(actual-expected)/denominator, np.nan)
+        for i, (_, row) in enumerate(frame.iterrows()):
+            rows.append(dict(domain=domain, check=name, dopant=row.dopant,
+                substitution_pct=float(row.substitution_pct),
+                host_structure_id=row.get("host_structure_id", "bulk_reference"),
+                reported_value=actual[i], recomputed_value=expected[i], unit=unit,
+                relative_error=error[i], status=status[i]))
+
+    # For volumetric densities in cm^-3 and mobility in cm^2/Vs,
+    # q*p*mu is S/cm, so multiplication by 100 gives S/m.
+    check(screen, "sigma_scenario_S_m",
+          100*elementary_charge*screen.p_scenario_cm3*screen.mu_scenario_cm2_Vs,
+          "bulk", "sigma_S_m_equals_100_q_p_cm3_mu_cm2_Vs", "S/m", "hole_only_model_valid")
+    check(screen, "rho_scenario_ohm_m", np.divide(1., screen.sigma_scenario_S_m),
+          "bulk", "rho_equals_inverse_sigma", "ohm m", "hole_only_model_valid")
+    audit = pd.DataFrame(rows)
+    csv_out(audit, out / "transport_physics_checks.csv")
+    failures = int(audit.status.eq("fail").sum())
+    failure_summary = (audit.loc[audit.status.eq("fail")]
+        .groupby(["domain", "check"], dropna=False)
+        .agg(failures=("status", "size"), max_relative_error=("relative_error", "max"))
+        .reset_index())
+    report = dict(
+        checks_passed=int(audit.status.eq("pass").sum()), checks_failed=failures,
+        checks_not_evaluated=int(audit.status.str.startswith("not_evaluated").sum()),
+        status="pass" if failures == 0 else "fail",
+        relative_tolerance=rtol, absolute_tolerance=atol,
+        csv_float_format=CSV_FLOAT_FORMAT, csv_float_parser="round_trip",
+        failure_summary=failure_summary.to_dict(orient="records"),
+        scope="Numerical transport identities and unit consistency only; not experimental/DFT validation.",
+        new_DFT_calculations_performed=False,
+        generated_structures_DFT_relaxed_by_this_workflow=False,
+        model_limitations=[
+            "DOS mass, background carriers, activation efficiency and scattering coefficients are assumptions.",
+            "Single-acceptor and dilute scattering approximations may fail at high substitution.",
+            "Device contacts, gate electrostatics and on/off ratio are not calculated."])
+    write_json(out / "transport_physics_audit.json", report)
+    if failures:
+        print("Transport identity failure details:\n" + failure_summary.to_string(index=False), flush=True)
+        raise ValueError(
+            f"{failures} transport identity checks failed; inspect "
+            f"{out / 'transport_physics_checks.csv'} and {out / 'transport_physics_audit.json'}. "
+            "The failing check names and maximum relative errors are printed above.")
+    print(f"Progress: Transport unit audit passed: {report['checks_passed']} checks; "
+          f"{report['checks_not_evaluated']} invalid scenarios not evaluated.", flush=True)
+
+    notes = (
+        "TRANSPORT UNITS AND DFT STATUS\n"
+        "sigma(S/m)=100*q*p(cm^-3)*mu(cm2/Vs); rho(ohm m)=1/sigma.\n"
+        "CSV retains 17 significant digits; transport checks use rtol=1e-10 and atol=0.\n"
+        "No DFT engine runs. Generated structures are unrelaxed starting inputs.\n"
+        "Numerical identities do not establish experimental accuracy.\n"
+        f"This run: {report['checks_passed']} passed; {report['checks_failed']} failed; "
+        f"{report['checks_not_evaluated']} invalid hole-only scenarios not evaluated.\n"
+        "Details: transport_physics_checks.csv; assumptions: CALCULATION_REFERENCE.txt.\n"
+    )
+    (out / "TRANSPORT_PHYSICS_AND_DFT_STATUS.txt").write_text(notes, encoding="utf-8")
+    return report
+
+
+
+def make_uncertainty_figures(screen, score_details, cfg, out):
+    """Use saved paired draws; never invent intervals or perturb central values."""
+    from matplotlib.lines import Line2D
+    pct = float(cfg["score_reference_pct"])
+    central = screen[np.isclose(screen.substitution_pct, pct, atol=1e-9, rtol=0)]
+    if central.dopant.duplicated().any() or set(central.dopant) != set(DOPANTS):
+        raise ValueError("Uncertainty plots require one central row per dopant.")
+    central = central.set_index("dopant").reindex(DOPANTS)
+    modes = ["shared_efficiency", "dopant_specific_efficiency"]
+    mode_labels = ["Shared efficiency", "Dopant-specific efficiency"]
+    mode_colors = ["#3B6FB6", "#DE8F05"]
+    properties = [
+        ("FE_eV_atom", "FE_ML_eV_atom", "Formation energy", "eV/atom", False),
+        ("p_cm3", "p_scenario_cm3", "Hole density", r"cm$^{-3}$", True),
+        ("mu_cm2_Vs", "mu_scenario_cm2_Vs", "Mobility", r"cm$^2$/(V s)", True),
+        ("sigma_S_m", "sigma_scenario_S_m", "Conductivity", "S/m", True),
+    ]
+    records = []
+
+    def add_summary(dopant, mode, prop, unit, values, centre, positive):
+        values = np.asarray(values, float)
+        usable = np.isfinite(values)
+        if positive: usable &= values > 0
+        finite = values[usable]
+        # A single finite draw does not establish an uncertainty range.
+        bounds = np.quantile(finite, [.05, .50, .95]) if len(finite) >= 2 else [np.nan] * 3
+        return dict(dopant=dopant, substitution_pct=pct, efficiency_mode=mode,
+                    property=prop, unit=unit, central_value=float(centre),
+                    p05=bounds[0], p50=bounds[1], p95=bounds[2],
+                    total_draws=len(values), valid_draws=len(finite),
+                    valid_draw_fraction=len(finite) / len(values) if len(values) else np.nan,
+                    interval_status="available" if len(finite) >= 2 else "fewer_than_two_valid_draws",
+                    interval_basis="conditional_on_usable_draws; scenario_sensitivity_not_calibrated_CI")
+
+    with np.load(out / "mc_scenario_draws.npz", allow_pickle=False) as mc:
+        draw_modes = mc["efficiency_mode"].astype(str)
+        if set(draw_modes) != set(modes):
+            raise ValueError("Uncertainty plots require both saved efficiency modes.")
+        indexes = []
+        for dopant in DOPANTS:
+            matches = np.flatnonzero((mc["dopants"] == dopant) &
+                np.isclose(mc["substitution_pct"], pct, atol=1e-9, rtol=0))
+            if len(matches) != 1: raise ValueError("Uncertainty draw/composition alignment failed.")
+            indexes.append(int(matches[0]))
+        for prop, column, _, unit, positive in properties:
+            draws = mc[prop]
+            if draws.shape != (len(draw_modes), len(mc["dopants"])):
+                raise ValueError("Unexpected Monte Carlo array shape: " + prop)
+            for mode in modes:
+                for d, index in zip(DOPANTS, indexes):
+                    records.append(add_summary(d, mode, prop, unit, draws[draw_modes == mode, index],
+                                               central.loc[d, column], positive))
+    table = pd.DataFrame(records)
+    csv_out(table, out / "property_uncertainty_at_reference.csv")
+
+    # Scores and physical outputs must refer to the very same simulation draws.
+    score_central = score_details.set_index("dopant").reindex(DOPANTS)
+    score_records = []
+    with np.load(out / "score_scenario_draws.npz", allow_pickle=False) as mc:
+        if not np.isclose(float(mc["substitution_pct"]), pct, atol=1e-9, rtol=0):
+            raise ValueError("Score uncertainty concentration differs from the selected reference.")
+        if mc["scores"].shape != (len(draw_modes), len(mc["dopants"])):
+            raise ValueError("Score and physical scenario draw counts differ.")
+        for d in DOPANTS:
+            matches = np.flatnonzero(mc["dopants"] == d)
+            if len(matches) != 1: raise ValueError("Score uncertainty dopant alignment failed.")
+            for mode in modes:
+                score_records.append(add_summary(d, mode, "score_0_100", "score points",
+                    mc["scores"][draw_modes == mode, int(matches[0])],
+                    score_central.loc[d, "score_0_100"], False))
+    score_table = pd.DataFrame(score_records)
+    csv_out(score_table, out / "score_uncertainty_at_reference.csv")
+
+    def interval_panel(ax, frame, prop, title, unit, logarithmic=False):
+        positions = np.arange(len(DOPANTS), dtype=float)
+        for j, (mode, color) in enumerate(zip(modes, mode_colors)):
+            part = frame[frame.efficiency_mode.eq(mode) & frame.property.eq(prop)]
+            part = part.set_index("dopant").reindex(DOPANTS)
+            xs = positions + (j - .5) * .22
+            for x, (_, row) in zip(xs, part.iterrows()):
+                if np.isfinite([row.p05, row.p50, row.p95]).all():
+                    ax.errorbar(x, row.p50, yerr=[[row.p50 - row.p05], [row.p95 - row.p50]],
+                                fmt="o", ms=4.5, color=color, capsize=4, lw=1.7, zorder=3)
+                else:
+                    ax.text(x, .025, "n/a", ha="center", rotation=90, color=color,
+                            fontsize=8, transform=ax.get_xaxis_transform())
+        first = frame[frame.efficiency_mode.eq(modes[0]) & frame.property.eq(prop)]
+        first = first.set_index("dopant").reindex(DOPANTS)
+        values = first.central_value.to_numpy(float)
+        good = np.isfinite(values)
+        if logarithmic: good &= values > 0
+        ax.plot(positions[good], values[good], "D", ms=5, color="#111827", ls="none", zorder=4)
+        all_values = frame.loc[frame.property.eq(prop), ["p05", "p50", "p95", "central_value"]].to_numpy(float)
+        if logarithmic and np.any(np.isfinite(all_values) & (all_values > 0)):
+            ax.set_yscale("log")
+        elif logarithmic:
+            ax.text(.5, .5, "No valid positive values", ha="center", transform=ax.transAxes)
+        ax.set(title="", ylabel=f"{title}\n({unit})", xticks=positions, xticklabels=DOPANTS,
+               xlim=(-.5, len(DOPANTS) - .5))
+        ax.yaxis.label.set_fontsize(13)
+        ax.yaxis.label.set_linespacing(1.3)
+        for spine in ax.spines.values():
+            spine.set_visible(True)
+            spine.set_linewidth(1.2)
+        ax.grid(axis="y", alpha=.17); ax.set_axisbelow(True)
+        if not logarithmic: ax.ticklabel_format(axis="y", useOffset=False)
+
+    legend = [Line2D([0], [0], color=c, marker="o", lw=1.5,
+                     label=label + ": median and 5–95% range")
+              for c, label in zip(mode_colors, mode_labels)]
+    legend.append(Line2D([0], [0], color="#111827", marker="D", lw=0, label="Central estimate"))
+    fig, axes = plt.subplots(2, 2, figsize=(14.5, 10.2))
+    fig.subplots_adjust(left=.13, right=.97, top=.91, bottom=.17, hspace=.32, wspace=.36)
+    # Display-only, intentionally wider axes. None of the Monte Carlo input ranges,
+    # medians or 5-95% uncertainty bounds are altered or clipped. The wider
+    # axes simply make the SAME intervals occupy less space on the plotted scale.
+    broad_axis_limits = {
+        "FE_eV_atom": (-3.0, 0.0),       # eV/atom; linear
+        "p_cm3": (1e12, 1e22),           # cm^-3; logarithmic
+        "mu_cm2_Vs": (0.5, 150.0),       # cm^2/(V s); logarithmic
+        "sigma_S_m": (1e-3, 1e6),        # S/m; logarithmic
+    }
+    for ax, (prop, _, title, unit, logarithmic) in zip(axes.ravel(), properties):
+        interval_panel(ax, table, prop, title, unit, logarithmic)
+        lower, upper = broad_axis_limits[prop]
+        # Expand further if an actual reported endpoint would fall outside the
+        # requested wider range, so that no error bar is hidden or truncated.
+        plotted = table.loc[table.property.eq(prop), ["p05", "p50", "p95", "central_value"]].to_numpy(float)
+        plotted = plotted[np.isfinite(plotted)]
+        if logarithmic:
+            positive = plotted[plotted > 0]
+            if len(positive):
+                lower = min(lower, float(positive.min()) / 1.1)
+                upper = max(upper, float(positive.max()) * 1.1)
+        elif len(plotted):
+            lower = min(lower, float(plotted.min()) - .05)
+            upper = max(upper, float(plotted.max()) + .05)
+        ax.set_ylim(lower, upper)
+    fig.suptitle(f"SnO property uncertainty at {pct:g}% substitution ({cfg['temperature_K']:g} K)",
+                 fontsize=17, y=.985)
+    fig.legend(handles=legend, loc="lower center", bbox_to_anchor=(.54, .087),
+               frameon=False, ncols=3, fontsize=10)
+    fig.text(.13, .025,
+             "Error bars: 5th–95th percentile of valid model scenarios; not calibrated confidence intervals.",
+             fontsize=10)
+    save_figure(fig, out / "figures" / "24_property_uncertainty")
+
+    fig, ax = plt.subplots(figsize=(11.8, 6.8))
+    fig.subplots_adjust(left=.13, right=.98, top=.84, bottom=.23)
+    interval_panel(ax, score_table, "score_0_100", "Fixed scoring weights and central normalization anchors",
+                   "Dopant preference score (0–100)")
+    ax.set_ylim(-3, 103)
+    fig.suptitle(f"SnO dopant-score uncertainty | {pct:g}% sublattice substitution", fontsize=14, y=.96)
+    fig.legend(handles=legend, loc="lower center", bbox_to_anchor=(.54, .10),
+               frameon=False, ncols=3, fontsize=10)
+    fig.text(.13, .025, "Model-scenario 5th–95th percentiles; not calibrated confidence intervals.", fontsize=10)
+    save_figure(fig, out / "figures" / "25_score_uncertainty")
+    return table, score_table
+
+
+
+def write_compact_summary(screen, selection, cfg, out):
+    """Five-dopant summary and one shared figure list for notebook and HTML."""
+    pct = float(cfg["score_reference_pct"])
+    part = screen[np.isclose(screen.substitution_pct, pct, rtol=0, atol=1e-9)]
+    if part.dopant.duplicated().any() or set(part.dopant) != set(DOPANTS):
+        raise ValueError("Compact summary needs exactly one reference row per dopant.")
+    part = part.set_index("dopant").reindex(DOPANTS)
+    result = pd.DataFrame({"Dopant": DOPANTS,
+        "Formation energy (eV/atom)": part.FE_ML_eV_atom.to_numpy(),
+        "Conductivity (S/m)": part.sigma_scenario_S_m.to_numpy(),
+        "Mobility (cm2/Vs)": part.mu_scenario_cm2_Vs.to_numpy(),
+        "Hole density (cm-3)": part.p_scenario_cm3.to_numpy(),
+        "Resistivity (ohm m)": part.rho_scenario_ohm_m.to_numpy()})
+    csv_out(result, out / "main_dopant_results.csv")
+    csv_out(screen[["dopant", "site", "substitution_pct", "FE_ML_eV_atom", "FE_bootstrap_p05", "FE_bootstrap_p95",
+                    "FE_empirical_lower", "FE_empirical_upper", "in_domain", "supported_screening"]],
+            out / "bulk_formation_energy_all_dopants.csv")
+    figures = ["02_GradientBoosting_validation.png", "08_formation_energy_all_dopants.png",
+               "23_bulk_conductivity_all_dopants.png", "26_bulk_mobility_all_dopants.png",
+               "27_NaK_conductivity_ratio.png", "10_dopant_score_components.png",
+               "07_conductivity_uncertainty.png",
+               "24_property_uncertainty.png", "25_score_uncertainty.png",
+               "21_selection_weight_sensitivity.png", "22_selection_input_sensitivity.png"]
+    for name in figures:
+        if not (out / "figures" / name).is_file():
+            raise FileNotFoundError("Required displayed figure was not created: " + name)
+    write_json(out / "compact_summary.json", dict(substitution_pct=pct,
+        selected_dopants=selection["selected_dopants"], selection_status=selection["selection_status"],
+        formation_energy_kind="compound-energy ML proxy, not charged-defect formation energy",
+        transport_kind="sigma_S_m=100*q*p_cm3*mu_cm2_Vs; physical parameter scenario",
+        new_DFT_calculations_performed=False, physics_audit_file="transport_physics_audit.json",
+        uncertainty_basis="5th/50th/95th percentiles of usable saved scenario draws, by efficiency mode",
+        display_figures=figures))
+
+
+
+
+# Reporting helpers embedded into the complete SnO workflow.
+
+def write_clear_counts(data, raw, cfg, out):
+    """Keep database records, ML samples and generated starting inputs separate."""
+    if data.material_id.duplicated().any():
+        raise ValueError("Duplicate material IDs in the ML dataset.")
+    split = pd.read_csv(out / "data_splits.csv")
+    if split.material_id.duplicated().any() or set(split.material_id) != set(data.material_id):
+        raise ValueError("Saved train/test split does not match the curated ML dataset.")
+    if not set(split.partition) <= {"development", "locked_test"}:
+        raise ValueError("Unknown ML partition label.")
+    development, test = [split[split.partition.eq(k)] for k in ["development", "locked_test"]]
+    if development.empty or test.empty or len(development) + len(test) != len(data):
+        raise ValueError("Training/test counts are incomplete.")
+    if set(development.formula) & set(test.formula):
+        raise ValueError("Composition groups overlap between development and test.")
+    samples = pd.DataFrame([dict(stage=label, samples=len(frame), unique_compositions=frame.formula.nunique())
+        for label, frame in [("Training / cross-validation", development),
+                             ("Held-out testing", test), ("Total ML samples", split)]])
+    csv_out(samples, out / "ml_sample_counts.csv")
+    manifest = out / "starting_structure_manifest.csv"
+    if manifest.exists():
+        generated = pd.read_csv(manifest)
+        if generated.file.duplicated().any(): raise ValueError("Duplicate generated-file names.")
+        n_generated = len(generated)
+    else:
+        if cfg["make_dft_starting_structures"]:
+            raise ValueError("Requested starting-structure manifest is missing.")
+        n_generated = 0
+    host_count = len({str(d["material_id"]) for d in raw["hosts"]})
+    ternary_count = len({str(d["material_id"]) for d in raw["ternaries"]})
+    csv_out(pd.DataFrame([dict(material="Pristine SnO records retrieved", count=host_count)]),
+            out / "simple_material_counts.csv")
+    host, target = data.A.eq("HOST"), data.A.isin(DOPANTS)
+    rows = [
+        ("Database search", "Pristine SnO records retrieved", host_count,
+         "Unique Materials Project IDs from the SnO query; polymorphs are not merged."),
+        ("Database search", "Sn-O-A ternary records retrieved", ternary_count,
+         "Unique IDs before the local training filters."),
+        ("ML dataset", "Retained ternary structures", int((~host).sum()),
+         "Sn + O + one additional element, after training filters."),
+        ("ML dataset", "Of these: ternaries with Li, Na, K, N or P", int(target.sum()),
+         "Subset of retained ternaries; does not prove substitutional doping."),
+        ("ML dataset", "Pristine SnO references used for ML", int(host.sum()),
+         "Selected semiconducting P4/nmm reference; not every retrieved polymorph."),
+        ("ML dataset", "Total ML structures", len(data),
+         "Retained ternaries plus the selected host; generated structures excluded."),
+        ("Generated inputs", "Doped SnO starting structures", n_generated,
+         "Unrelaxed atomic substitutions, counted separately; no DFT engine is run."),
+        ("Virtual screening", "Dopant/concentration rows", len(DOPANTS) * len(cfg["requested_pareto_pct"]),
+         "Virtual predictions, not database structures or ML labels."),
+    ]
+    counts = pd.DataFrame(rows, columns=["group", "structure_type", "count", "meaning"])
+    csv_out(counts, out / "structure_counts.csv")
+    (out / "COUNTS_EXPLAINED.txt").write_text(
+        "STRUCTURE AND SAMPLE COUNTS\n"
+        "Counts of database records use unique Materials Project IDs; geometric prototypes are not deduplicated.\n"
+        "Target-dopant ternaries are a subset of retained ternaries, not additional structures.\n"
+        "Generated atomic substitutions and virtual screening rows are excluded from ML counts.\n"
+        f"Development: {len(development)} rows / {development.formula.nunique()} compositions.\n"
+        f"Locked test: {len(test)} rows / {test.formula.nunique()} compositions.\n"
+        f"Final refit after evaluation: {len(data)} rows.\n"
+        "Training labels are compound formation energies. Transport uses declared physical parameters.\n"
+        "Definitions: structure_counts.csv; saved partitions: data_splits.csv.\n", encoding="utf-8")
+    write_json(out / "sample_count_summary.json", dict(
+        training_samples=len(development), testing_samples=len(test), total_samples=len(split),
+        training_compositions=int(development.formula.nunique()), testing_compositions=int(test.formula.nunique()),
+        final_refit_samples=len(data), transport_ML_model_trained=False))
+    return counts, samples
+
+
+def plot_clear_selection_sensitivity(table, cfg, out):
+    """Show selection frequency across weights and across physical input draws."""
+    pct = float(cfg["score_reference_pct"])
+
+    def get(experiment):
+        part = table[table.experiment.eq(experiment)]
+        if len(part) != len(DOPANTS) or part.dopant.duplicated().any():
+            raise ValueError("Missing/duplicate all-dopant sensitivity rows.")
+        return part.set_index("dopant").reindex(DOPANTS)
+
+    def draw_bars(ax, x, part, color, width=.65, label=None):
+        usable = np.isfinite(part.top_share) & (part.valid_draw_fraction > 0)
+        values = np.where(usable, 100 * part.top_share, 0.)
+        ax.bar(x, values, color=color, width=width, label=label)
+        for position, value, valid in zip(x, values, usable):
+            ax.text(position, value + 1.8, f"{value:.1f}" if valid else "n/a",
+                    ha="center", va="bottom", fontsize=9)
+
+    pos = np.arange(len(DOPANTS))
+    part = get("preference_weights")
+    fig, ax = plt.subplots(figsize=(9.2, 5.5))
+    fig.subplots_adjust(left=.10, right=.98, bottom=.24, top=.78)
+    draw_bars(ax, pos, part, [COLORS[d] for d in DOPANTS])
+    ax.set(xticks=pos, xticklabels=DOPANTS, ylim=(0, 112), yticks=[0, 25, 50, 75, 100],
+           ylabel="Selected in weight trials (%)", xlabel="Dopant",
+           title=f"{int(part.draws.iloc[0]):,} trials; central material inputs held fixed")
+    ax.grid(axis="y", alpha=.14); ax.set_axisbelow(True)
+    fig.suptitle(f"SnO selection sensitivity to scoring weights | {pct:g}%", fontsize=14, y=.97)
+    fig.text(.10, .055, "Only log-conductivity and mobility weights vary; formation energy is excluded.",
+             fontsize=10)
+    save_figure(fig, out / "figures" / "21_selection_weight_sensitivity")
+
+    fig, ax = plt.subplots(figsize=(10.2, 6.0))
+    fig.subplots_adjust(left=.10, right=.98, bottom=.30, top=.78)
+    experiments = ["shared_efficiency", "dopant_specific_efficiency"]
+    labels = ["Shared activation efficiency", "Dopant-specific activation efficiency"]
+    counts = []
+    for j, (mode, label, color) in enumerate(zip(experiments, labels, ["#527da8", "#df9850"])):
+        part = get(mode); counts.append(int(part.draws.iloc[0]))
+        draw_bars(ax, pos + (j - .5) * .36, part, color, width=.36, label=label)
+    ax.set(xticks=pos, xticklabels=DOPANTS, ylim=(0, 112), yticks=[0, 25, 50, 75, 100],
+           xlabel="Dopant", ylabel="Selected in input trials (%)",
+           title=f"{counts[0]:,} / {counts[1]:,} trials; scoring weights held fixed")
+    ax.grid(axis="y", alpha=.14); ax.set_axisbelow(True)
+    fig.legend(*ax.get_legend_handles_labels(), loc="lower center", bbox_to_anchor=(.54, .17),
+               ncols=2, frameon=False, fontsize=10)
+    fig.suptitle(f"SnO selection sensitivity to uncertain inputs | {pct:g}%", fontsize=14, y=.97)
+    fig.text(.10, .045, "Two separate input modes; frequencies represent model scenarios, not probabilities.",
+             fontsize=10)
+    save_figure(fig, out / "figures" / "22_selection_input_sensitivity")
+    (out / "SENSITIVITY_EXPLAINED.txt").write_text(
+        "SELECTION SENSITIVITY\nFigure 21: vary scoring weights, holding central material inputs fixed.\n"
+        "Figure 22: vary transport inputs, holding scoring weights fixed; FE is not scored.\n"
+        "Blue: shared activation efficiency. Orange: dopant-specific activation efficiency.\n"
+        "Each colour is a separate trial set. Ties split a win; invalid trials stay in denominators.\n"
+        "Figures retain all five dopants. Complete data: final_selection_sensitivity.csv.\n",
+        encoding="utf-8")
+
+
+def concise_calculation_guide(cfg, physical_assumptions):
+    """Readable equations and the active inputs, rendered offline."""
+    def number(value):
+        text = f"{float(value):.4g}"
+        if "e" not in text: return text
+        mantissa, exponent = text.split("e")
+        power = str(int(exponent)).translate(str.maketrans("-0123456789", "⁻⁰¹²³⁴⁵⁶⁷⁸⁹"))
+        return mantissa + " × 10" + power
+    pars = physical_assumptions
+    weights = validate_score_config(cfg)
+    labels = ["energy (excluded)", "log conductivity", "mobility"]
+    inputs = [
+        ("Active dopant fraction", f"{100 * pars['active_fraction']:g}%"),
+        ("Compensation fraction", f"{100 * pars['compensation_fraction']:g}%"),
+        ("Background hole density", number(pars["p0_cm3"]) + " cm⁻³"),
+        ("Baseline mobility", number(pars["mu0_cm2_Vs"]) + " cm²/(V·s)"),
+        ("Mismatch coefficient A", number(pars["alloy_scattering"]) + " (dimensionless)"),
+        ("Active-dopant scattering coefficient B", number(pars["ion_scattering"]) + " (dimensionless)"),
+        ("Score weights", "; ".join(f"{label} {100 * w:.3g}%" for label, w in zip(labels, weights))),
+    ]
+    equations = [
+        ("Active acceptor density", "N<sub>A</sub> = x × N<sub>site</sub> × η",
+         "Nₐ = x × Nsite × η", "x is the substituted-sublattice fraction; η is the active fraction; density is cm⁻³."),
+        ("Dopant-host differences",
+         "δ<sub>r</sub> = |r<sub>D</sub> − r<sub>site</sub>| / r<sub>site</sub>; Δχ = |χ<sub>D</sub> − χ<sub>site</sub>|",
+         "δr = |rD − rsite| / rsite; Δχ = |χD − χsite|",
+         "r is covalent radius; χ is electronegativity. D denotes the dopant and site the substituted host atom."),
+        ("Hole mobility",
+         "μ = μ<sub>0</sub> / [1 + Ax(1 − x)(δ<sub>r</sub><sup>2</sup> + 0.15(Δχ)<sup>2</sup>) + Bxη]",
+         "μ = μ0 / [1 + A*x*(1 − x)*(δr² + 0.15*(Δχ)²) + B*x*η]",
+         "μ0 is reference mobility. A = alloy_scattering and B = ion_scattering are assumed dimensionless coefficients; x and η are fractions."),
+        ("Mobility retention", "R<sub>μ</sub> = μ / μ<sub>0</sub>", "Rμ = μ / μ0",
+         "Dimensionless fraction of the reference mobility retained."),
+        ("Conductivity", "σ = 100 × q × p × μ", "σ = 100 × q × p × μ",
+         "Result: S/m, using p in cm⁻³ and μ in cm²/(V·s). The factor 100 converts to SI."),
+        ("Resistivity", "ρ = 1 / σ", "ρ = 1 / σ", "Result: Ω·m when σ is in S/m."),
+        ("Preference score", "Score = 100 × ∑<sub>i</sub> w<sub>i</sub>U<sub>i</sub>",
+         "Score = 100 × sum of (weight × desirability)",
+         "Each U ranges from 0 to 1. Only higher log-conductivity and higher mobility contribute to the preference score; formation energy is excluded."),
+        ("Scenario uncertainty", "Range = [Q<sub>0.05</sub>, Q<sub>0.95</sub>]; median = Q<sub>0.50</sub>",
+         "Range = [5th percentile, 95th percentile]; median = 50th percentile",
+         "Computed from the saved usable Monte Carlo draws, separately for shared and dopant-specific activation efficiency."),
+    ]
+    activation = []
+    for dopant in DOPANTS:
+        centre, low, high, doi, evidence = EA[dopant]
+        source = "Literature input" if evidence == "reported_effective_activation" and doi else "Assumed"
+        activation.append((f"{dopant} ({SITES[dopant]} site)", number(centre),
+                           f"{number(low)}–{number(high)}", source, doi))
+    return dict(equations=equations, inputs=inputs, activation=activation,
+        symbols="q = 1.602176634 × 10⁻¹⁹ C; p = hole density (cm⁻³); μ = mobility (cm²/(V·s)).",
+        logic="Gradient Boosting predicts compound formation energy. Hole densities follow acceptor charge balance with Fermi–Dirac statistics. Mobility uses the configured baseline and dopant scattering penalties.",
+        at=f"Temperature: {cfg['temperature_K']:g} K. Reference comparison: {cfg['score_reference_pct']:g}% sublattice substitution.",
+        sources="Energies and structures: Materials Project. Na/K/N activation sources are linked below; Li/P activation values are assumptions.",
+        note="Effective Hall activation inputs are process dependent and need not equal thermodynamic charge-transition levels.",
+        limits="Transport remains a parameter scenario. Percentile ranges are not calibrated confidence intervals. Compound formation energy is not charged-defect formation energy; device switching is not calculated.")
+
+
+def concise_calculation_text(cfg, physical_assumptions):
+    guide = concise_calculation_guide(cfg, physical_assumptions)
+    lines = ["CALCULATIONS — QUICK GUIDE", guide["at"], "", guide["logic"], ""]
+    for label, _, formula, meaning in guide["equations"]:
+        lines.extend([label + ": " + formula, meaning, ""])
+    lines.extend([guide["symbols"], "", "ACTIVE INPUTS"])
+    for label, value in guide["inputs"]: lines.append(f"{label}: {value}")
+    lines.extend(["", "ACTIVATION ENERGY (eV; central and scenario bounds)"])
+    for dopant, centre, bounds, source, doi in guide["activation"]:
+        lines.append(f"{dopant}: {centre}; range {bounds}; {source}" + (" — https://doi.org/" + doi if doi else ""))
+    lines.extend([guide["note"], "", guide["sources"], guide["limits"], "",
+        "Full methods: calculation_basis.csv. Active inputs/bounds: calculation_parameters.csv.",
+        "Source registry: references.csv. Complete settings: run_config.json. Units: COLUMN_GUIDE.csv."])
+    return "\n".join(lines) + "\n"
+
+
+def concise_calculation_html(out, inline=False):
+    from html import escape
+    out = Path(out)
+    saved = json.loads(find_result_file(out, "run_config.json").read_text(encoding="utf-8"))
+    guide = concise_calculation_guide(saved["config"], saved["physical_assumptions"])
+    chunks = ['<details class="calculation-guide"><summary>Calculations explained — equations, inputs and sources</summary>',
+              '<p>' + escape(guide["logic"]) + '</p><div class="equation-list">']
+    for label, formula, _, meaning in guide["equations"]:
+        chunks.append('<div class="equation-row"><strong>' + escape(label) + '</strong>'
+            '<div class="equation">' + formula + '</div><p>' + escape(meaning) + '</p></div>')
+    chunks.extend(['</div><p class="symbols">' + escape(guide["symbols"]) + '</p>',
+        '<h3>Active inputs</h3><p>' + escape(guide["at"]) + '</p>',
+        '<div class="scroll"><table><thead><tr><th>Input</th><th>Value</th></tr></thead><tbody>'])
+    for row in guide["inputs"]:
+        chunks.append('<tr>' + ''.join('<td>' + escape(cell) + '</td>' for cell in row) + '</tr>')
+    chunks.extend(['</tbody></table></div><h3>Activation energy inputs</h3>',
+        '<div class="scroll"><table><thead><tr><th>Dopant (site)</th><th>Central E<sub>A</sub> (eV)</th>'
+        '<th>Scenario bounds (eV)</th><th>Source role</th></tr></thead><tbody>'])
+    for dopant, centre, bounds, source, doi in guide["activation"]:
+        link = ('<a href="https://doi.org/' + escape(doi, quote=True) + '">' + escape(source) + '</a>') if doi else escape(source)
+        chunks.append('<tr>' + ''.join('<td>' + escape(cell) + '</td>' for cell in (dopant, centre, bounds))
+                      + '<td>' + link + '</td></tr>')
+    chunks.append('</tbody></table></div>')
+    for key in ["note", "sources", "limits"]: chunks.append('<p>' + escape(guide[key]) + '</p>')
+    links = []
+    for name, label in [("calculation_basis.csv", "Full methods"), ("calculation_parameters.csv", "All inputs/bounds"),
+                        ("host_reference.json", "Host reference"), ("references.csv", "Source registry")]:
+        if inline: links.append(escape(name))
+        else:
+            path = find_result_file(out, name).relative_to(out).as_posix()
+            links.append('<a href="' + escape(path, quote=True) + '">' + escape(label) + '</a>')
+    chunks.append('<p class="guide-files">Details in the results ZIP: ' + ' · '.join(links) + '.</p></details>')
+    return '\n'.join(chunks)
+
+
+def write_calculation_reference(cfg, out):
+    """Report the active inputs and their role without changing any calculation.
+
+    Numerical provenance remains in run_config.json, source registries, per-host
+    metadata and the original tables. This is a reader-facing map of that evidence.
+    All sources below are inherited from the supplied workflow, not reverified here.
+    """
+    rows = []
+    def add(topic, rule, reason, source):
+        rows.append(dict(calculation=topic, equation_or_rule=rule,
+                         reason_and_scope=reason, source_or_implementation=source))
+    add("Bulk training data",
+        "Nondeprecated ordered Sn-O-A ternaries + selected P4/nmm SnO host; finite FE and hull energy; "
+        f"hull <= {cfg['mp_hull_max_eV_atom']:g} eV/atom; exclude {sorted(EXCLUDED_ELEMENTS)}.",
+        "FE labels describe bulk compounds. A ternary record does not establish substitutional doping. "
+        "The selected host has a positive source gap; lowest hull energy, then smallest cell, breaks ties.",
+        "Materials Project; raw_materials.json; rejected_records.csv; curate()")
+    add("Features and ML evaluation",
+        "Composition fractions, entropy and weighted elemental descriptors; optional structure descriptors. "
+        "Median imputation -> constant-feature removal -> scaling -> GradientBoosting(huber). "
+        "GroupShuffleSplit by formula; nested GroupKFold; tune on development MAE; test once; refit on all rows.",
+        "Keeps polymorphs of a composition in one partition. Test permutation importance is diagnostic only. "
+        "Optional virtual structure descriptors use ideal host geometry. Pooled R2 uses all outer-fold predictions.",
+        "X_features_and_groups.csv; data_splits.csv; model_selection.json; train_gradient_boosting()")
+    add("Energy uncertainty and applicability",
+        "Bootstrap complete composition groups. FE envelope = bootstrap 5/95 percentiles +/- "
+        "90th percentile of the per-formula maximum absolute CV residual. "
+        "Robust-scaled nearest-neighbour threshold excludes same-formula reference neighbours.",
+        "Also require feature-range and dopant-fraction coverage. Bounds are screening diagnostics, "
+        "not calibrated coverage for unseen chemistries.",
+        "bootstrap_predictions(); applicability_domain(); prepare_predictions(); formation_energy_bootstrap_draws.npz")
+    add("Screening gates",
+        "CV MAE <= configured gate; test MAE < training-mean baseline; withheld-dopant MAE <= transfer gate; "
+        "in-domain; within dilute scope; experimental EA input; no process caution.",
+        "Supported means passes these modeling rules. The dilute limit is not solubility. "
+        "N has a process-specific caution above 7e17 nominal dopants/cm^3.",
+        "screening_results.csv; leave_one_dopant_out_metrics.csv; Becker 2019: 10.1063/1.5052606")
+    add("Concentration and site density",
+        "x = sublattice substitution percent/100; total-atom percent = 50*x. "
+        "Li/Na/K replace Sn; N/P replace O. Nsite = N_Sn/V_A3 * 1e24 cm^-3; NA = x*Nsite*active_fraction.",
+        "Uses the selected host volume and the designated sublattice.",
+        "SITES; prepare_predictions(); host_reference.json")
+    add("Acceptor neutrality",
+        "p(EF) + ND = p0 + NA/[1 + gA*exp((EA-EF)/kT)]; ND = compensation_fraction*NA; Ev = 0.",
+        "One effective acceptor level, fixed ionized background and fully ionized donors. "
+        "Film Hall activation inputs are not generally thermodynamic charge-transition levels. "
+        "Complexes, impurity bands, Hall factors and microstructure are not computed.",
+        "solve_holes(); dopant_evidence_registry.csv")
+    add("Bulk hole density",
+        "p = Nv*F_1/2(-EF/kT); Nv = 2*(2*pi*mDOS*kB*T/h^2)^(3/2)/1e6 cm^-3. "
+        "Neutrality is solved by bisection. Require EF < Eg/2 - 3*kT for the hole-only scenario.",
+        "Fermi-Dirac statistics include degeneracy; rigid-band and isolated-level assumptions remain. "
+        "The indirect gap guard screens a possible bipolar regime; invalid densities become NaN.",
+        "fermi_table(); fermi_half(); solve_holes(); Allen 2013: 10.1039/C3TC31863J")
+    add("Mobility and distortion proxies",
+        "dr=abs(rD-rsite)/rsite; dc=abs(chiD-chisite); A=alloy_scattering; B=ion_scattering. "
+        "mu=mu0/[1+A*x*(1-x)*(dr^2+0.15*dc^2)+B*x*eta]; Rmu=mu/mu0. "
+        "Bulk distortion=100*x*dr*distortion_scale; compatibility=exp(-1.6*dr-0.45*dc).",
+        "A and B are assumed dimensionless coefficients for mismatch and active-dopant scattering. "
+        "Radii use one covalent convention. Compatibility does not set EA. "
+        "Radius-free ablations remove radius penalties and distortion. The legacy mass diagnostic "
+        "m_transport_proxy_over_me=m_transport_over_me*[1+x*(mass_penalty*dr+0.1*dc)] "
+        "is retained for output compatibility only and is excluded from mobility and transport surrogates.",
+        "transport(); RADII; CHI; Cordero 2008: 10.1039/b801115j")
+    add("Conductivity and resistivity units",
+        "sigma(S/m)=100*q*p(cm^-3)*mu(cm2/Vs); rho(ohm m)=1/sigma; rho(ohm cm)=100/sigma.",
+        "The factor 100 converts q*p*mu from S/cm to S/m. Use the declared volume density and mobility.",
+        "transport(); transport_physics_checks.csv")
+    add("Energy and competing phases",
+        "FE_ML is compound formation energy. Competing-ternary proxy uses the "
+        "available ternary hull energies; it is removed in an ablation.",
+        "Compound FE is not dopant incorporation energy. Charged-defect energies require chemical "
+        "potentials, charge states, Fermi level and corrections. The ternary proxy omits binary/elemental competition.",
+        "phase_proxy(); objective_matrix(); Varley 2013: 10.1063/1.4819068; Togo 2006: 10.1103/PhysRevB.74.195128")
+    add("Pareto and preference scores",
+        "At fixed x, Pareto minimizes [FE,-log10(sigma),1-Rmu,distortion,phase_proxy]; no dominance weights. "
+        "Post-front compromise uses normalized distance to the ideal point. Preference score=100*sum(w*U) "
+        "using only log conductivity and mobility (2:1 weights); U=(cmax-c)/(cmax-cmin), constant U=0.5. "
+        "FE remains an independent Pareto objective and reported ML property, not a score input.",
+        "Missing positively weighted criteria are ineligible. Prefer the highest-score supported bulk candidate, "
+        "else label the leader exploratory. Keep exact ties. Anchors vary by concentration; "
+        "scores cannot optimize concentration on an absolute scale. Separate mobility weight adds preference "
+        "to mobility already present in conductivity.",
+        "pareto_analysis(); dopant_scoring(); score_normalization.csv; OECD/JRC: 10.1787/9789264043466-en")
+    add("Weight and input sensitivity",
+        "Weight sweep: vary the log-conductivity/mobility preferences with central material inputs fixed. "
+        "Input sweep: vary physical transport inputs with weights and central anchors fixed, clipping utilities to [0,1]. "
+        "Keep shared and dopant-specific efficiency modes separate; split tied wins; keep invalid draws in denominators.",
+        "Percentiles/top-choice shares describe selected scenarios, not confidence intervals or success probabilities. "
+        "Central inputs need not be the ensemble median. Na/K pairwise wins are not all-dopant wins.",
+        "sample_parameters(); robustness(); final_selection_sensitivity.csv; mc_input_draws.csv")
+    add("Sensitivity surrogates",
+        "Held-out Gradient Boosting models explain simulated Na/K differences. Interpret permutation "
+        f"importance only when holdout R2 >= {cfg['sensitivity_min_R2']:g} and MAE beats the training-median baseline.",
+        "Surrogates are not new measured-material predictors. Shuffle SD is not a confidence interval. "
+        "K-minus-Na score contributions favor K when positive; the documented ML difference targets favor Na when positive.",
+        "run_integrated_sensitivity(); 10_sensitivity/READ_INTERPRETATION.txt; surrogate_holdout_metrics.csv")
+    add("Precision, sources and validation",
+        "CSV retains 17 significant digits; float64 round-trip reload; transport identity tolerance "
+        "rtol=1e-10, atol=0. Missing/ineligible values remain NaN. Numerical checks do not validate material physics.",
+        "Literature inputs cannot also validate the model. Unpaired literature ranges remain unpaired. "
+        "Use matched experimental/DFT templates for independent comparisons. Device switching and operational "
+        "stability are not predicted. Bibliography and snapshot provenance are retained from the supplied code.",
+        "write_transport_physics_audit(); external_validation_status.json; references.csv; COLUMN_GUIDE.csv; workflow_source.py")
+    add("Displayed uncertainty ranges",
+        "For each dopant at the reference concentration, compute Q05/Q50/Q95 of saved usable draws, separately "
+        "for shared and dopant-specific efficiency. Scores retain central anchors and clip utilities to [0,1].",
+        "Energy draws (property uncertainty only, not preference score) combine group bootstrap with sampled per-formula mean residuals. Transport varies declared "
+        "physical inputs. Central estimates can differ from medians. Export valid fractions; fewer than two usable "
+        "draws gives an unavailable interval. Ranges are not calibrated confidence intervals.",
+        "make_uncertainty_figures(); mc_scenario_draws.npz; score_scenario_draws.npz; "
+        "property_uncertainty_at_reference.csv; score_uncertainty_at_reference.csv")
+    basis = pd.DataFrame(rows)
+    csv_out(basis, out / "calculation_basis.csv")
+
+    params = []
+    def entry(group, values, role, source):
+        params.append(dict(input_group=group,
+            active_values=json.dumps(values, ensure_ascii=False, sort_keys=True, default=str),
+            reason_and_units=role, source=source))
+    def settings(*keys): return {key: cfg[key] for key in keys}
+    entry("Grid and temperature", settings("temperature_K", "requested_pareto_pct", "score_reference_pct"),
+          "K; percent of the designated sublattice; comparison concentration.", "User CONFIG; virtual_grid()")
+    entry("Bulk physics", PHYSICS,
+          "Central scenario values; units are encoded in names. Fractions/degeneracies/penalty coefficients are dimensionless. "
+          "A=alloy_scattering and B=ion_scattering enter simplified mobility; mass_penalty and "
+          "m_transport_over_me are legacy diagnostic inputs only. "
+          "Gap is the indirect-gap guard, not the optical direct gap.", "Declared assumptions; 0.67 eV context: 10.1039/C3TC31863J")
+    entry("Bulk uncertainty", {
+          "p0_cm3": {"bounds": [2e17, 1e19], "distribution": "log_uniform"},
+          "mu0_cm2_Vs": [3., 30.], "m_dos_over_me": [.3, 1.5],
+          "active_fraction": {"bounds": [.01, 1.], "distribution": "log_uniform"},
+          "compensation_fraction": [0., .5], "mass_penalty": [.25, 1.],
+          "alloy_scattering": [3.5, 14.], "ion_scattering": [1.25, 5.], "distortion_scale": [.5, 1.5]},
+          "Absolute bounds in sample_parameters(); uniform unless marked log_uniform. "
+          "A=alloy_scattering and B=ion_scattering; the mass_penalty draw is retained only for "
+          "the legacy diagnostic and random-sequence continuity. EA bounds are in dopant_evidence_registry.csv.",
+          "Declared sensitivity assumptions; sample_parameters(); robustness()")
+    entry("Dopant/site/activation inputs", {
+          d: {"site": SITES[d], "role": ROLES[d], "EA_central_eV": EA[d][0],
+              "EA_bounds_eV": list(EA[d][1:3]), "doi": EA[d][3], "evidence": EA[d][4]} for d in DOPANTS},
+          "Effective activation inputs, not FE training labels; Li/P are unvalidated assumptions.", "EA; dopant_evidence_registry.csv")
+    entry("Element proxies", {"covalent_radii_A": RADII, "electronegativity": CHI},
+          "Consistent geometric/chemical descriptors; not ionic radii or defect charges. CHI values are retained from the supplied code.",
+          "RADII; CHI; Cordero radii: 10.1039/b801115j")
+    entry("Physical constants", {"q_C": elementary_charge, "kB_J_K": Boltzmann, "h_J_s": h, "m_e_kg": m_e},
+          "Resolved scipy.constants values used by neutrality and unit conversions.", "scipy.constants; requirements_resolved.txt")
+    entry("Data filters and feature policy", {**settings("mp_hull_max_eV_atom", "include_gnome", "use_structure_features"),
+          "excluded_elements": sorted(EXCLUDED_ELEMENTS)},
+          "Hull cutoff in eV/atom. Structural features are optional host-geometry proxies.",
+          "curate(); get_feature_columns(); run_config.json")
+    estimator, grid = gradient_boosting_spec(cfg)
+    if cfg.get("test_mode"): grid = {k: v[:1] for k, v in grid.items()}
+    entry("ML model and resampling", {**settings("seed", "run_size", "outer_folds", "inner_folds", "test_fraction",
+          "bootstrap_models", "mc_draws", "n_jobs"), "estimator": estimator.get_params(), "tuning_grid": grid},
+          "Group split fraction applies to compositions, so row fractions can differ. Actual split sizes are in ml_sample_counts.csv.",
+          "gradient_boosting_spec(); fit_search(); data_splits.csv")
+    entry("Screening gates", settings("cv_mae_gate_eV_atom", "transfer_mae_gate_eV_atom", "domain_quantile",
+          "max_out_of_range_fraction", "dilute_screening_limit_pct"),
+          "Declared tolerances, not physical constants or solubility limits; N process caution threshold is 7e17 cm^-3.",
+          "applicability_domain(); prepare_predictions(); 10.1063/1.5052606")
+    entry("Decision and sensitivity settings", settings("score_weights", "score_weight_draws", "score_close_margin_points",
+          "compromise_tolerance", "sensitivity_concentrations", "sensitivity_min_R2", "sensitivity_permutation_repeats"),
+          "Preference weights, tie/close margins and diagnostic settings. Configured weights are normalized before use.",
+          "dopant_scoring(); run_integrated_sensitivity(); score_normalization.csv")
+    entry("Generated starting structures", settings("make_dft_starting_structures", "structure_target_pct"),
+          "Unrelaxed atomic substitutions; the manifest records actual commensurate concentration.",
+          "write_starting_structures(); starting_structure_manifest.csv")
+    entry("Fixed numerical conventions", {"bulk_root_bracket_eV": [-3., 3.], "bulk_bisection_steps": 70,
+          "fermi_eta_grid": [-20., 80., 5001], "quadrature_nodes": 240, "quadrature_upper_squared": 130.,
+          "csv_significant_digits": 17, "transport_check_rtol": 1e-10, "transport_check_atol": 0.},
+          "Numerical resolution and arithmetic checks; saved precision does not imply physical accuracy.",
+          "fermi_table(); fermi_half(); solve_holes(); csv_out(); write_transport_physics_audit()")
+    parameters = pd.DataFrame(params)
+    csv_out(parameters, out / "calculation_parameters.csv")
+    (out / "CALCULATION_REFERENCE.txt").write_text(
+        concise_calculation_text(cfg, PHYSICS), encoding="utf-8")
+    return basis, parameters
+
+
+def compact_report_html(out, inline=False, full=False):
+    """Essential results first; all existing tables and calculation provenance kept.
+
+    The notebook and START_HERE views use the same table data. Expandable method
+    notes show native-HTML equations and a short input guide. Full methodological
+    tables remain linked in the ZIP. FULL_REPORT retains every plot and saved file.
+    """
+    from html import escape
+    out = Path(out)
+    style = """
+    .sno-report {font:14px/1.45 system-ui,sans-serif;color:#fff!important;background:#111827!important;
+      padding:18px;border-radius:10px;overflow-wrap:anywhere}
+    .sno-report * {color:#fff!important}
+    .sno-report table {border-collapse:collapse;width:100%;font-size:13px;background:#111827!important}
+    .sno-report th,.sno-report td {padding:7px 9px;border:1px solid #4b5563;text-align:left;vertical-align:top}
+    .sno-report th {background:#374151!important}
+    .sno-report tr:nth-child(even) td {background:#1f2937!important}
+    .sno-report h2 {font-size:19px;margin:24px 0 9px}.sno-report h3 {font-size:15px;margin:16px 0 7px}
+    .sno-report p {margin:8px 0}.sno-report a {text-decoration:underline}
+    .sno-report img {max-width:100%;height:auto}.sno-report .scroll {overflow-x:auto}
+    .sno-report details {margin:12px 0;border:1px solid #4b5563;padding:10px;border-radius:6px}
+    .sno-report summary {cursor:pointer;font-weight:600}.sno-report section {margin:20px 0}
+    .sno-report .status {border-left:3px solid #93c5fd;padding-left:10px}
+    .sno-report .calculation-guide {max-width:900px}
+    .sno-report .equation-list {margin:12px 0}
+    .sno-report .equation-row {padding:10px 12px;margin:8px 0;background:#1f2937;
+      border-left:3px solid #93c5fd;border-radius:4px;break-inside:avoid}
+    .sno-report .equation {font:22px/1.65 Georgia,"Cambria Math",serif;
+      overflow-x:auto;overflow-wrap:normal;white-space:nowrap;margin:3px 0}
+    .sno-report .equation sub,.sno-report .equation sup {font-size:70%;line-height:0}
+    .sno-report .equation-row p {margin:2px 0;font-size:13px}
+    .sno-report .symbols {padding:8px 0;line-height:1.7}
+    .sno-report .guide-inputs,.sno-report .guide-activation {table-layout:auto;min-width:360px}
+    .sno-report .guide-files {font-size:12px}
+    @media (max-width:600px) {.sno-report {padding:10px}
+      .sno-report .equation {font-size:19px}.sno-report th,.sno-report td {padding:6px}}
+    """
+    def read(name): return pd.read_csv(find_result_file(out, name), float_precision="round_trip")
+    def render(frame):
+        return '<div class="scroll">' + frame.to_html(index=False, escape=True,
+            float_format=lambda x: f"{x:.4g}", na_rep="—") + '</div>'
+    def table(name, title, frame=None):
+        frame = read(name) if frame is None else frame
+        link = "" if inline else (' <a href="' + escape(find_result_file(out, name).relative_to(out).as_posix(), quote=True)
+                                 + '">CSV</a>')
+        return '<h3>' + escape(title) + link + '</h3>' + render(frame)
+    summary = json.loads(find_result_file(out, "compact_summary.json").read_text())
+    physics = json.loads(find_result_file(out, "transport_physics_audit.json").read_text())
+    counts = read("structure_counts.csv")
+    body = ['<h2>Structure and data counts</h2>']
+    for group, part in counts.groupby("group", sort=False):
+        body.append('<h3>' + escape(group) + '</h3>' + render(part[["structure_type", "count"]].rename(
+            columns={"structure_type": "Structure type", "count": "Count"})))
+    body.append('<p>Target-dopant ternaries are a subset. Generated entries are unrelaxed, excluded from database/ML counts; '
+                'virtual prediction rows are not additional structures.</p>')
+    body.append(table("ml_sample_counts.csv", "Training and testing samples", read("ml_sample_counts.csv").rename(
+        columns={"stage": "Dataset part", "samples": "Structures", "unique_compositions": "Unique compositions"})))
+    body.append('<p>CV uses development rows; final refit uses all ML rows after testing. '
+                'Only bulk compound formation energy is learned; transport uses physical scenarios.</p>')
+    for stem in ["dataset_summary", "dopant_distribution", "gradient_boosting_metrics"]:
+        body.append(table(stem + ".csv", TABLE_TITLES[stem], read(stem + ".csv").rename(columns=DISPLAY_NAMES)))
+    body.append(f'<h2>Dopant results at {summary["substitution_pct"]:g}% substitution</h2>')
+    body.append(table("main_dopant_results.csv", "Central results", read("main_dopant_results.csv").rename(
+        columns={"Mobility (cm2/Vs)": "Mobility (cm²/(V·s))", "Hole density (cm-3)": "Hole density (cm⁻³)",
+                 "Resistivity (ohm m)": "Resistivity (Ω·m)"})))
+    for stem in ["dopant_score_summary", "concentration_central_scores_independent"]:
+        body.append(table(stem + ".csv", TABLE_TITLES[stem], read(stem + ".csv").rename(columns=DISPLAY_NAMES)))
+    body.append('<p class="status">Selected candidate(s): <strong>'
+                + escape(", ".join(summary["selected_dopants"]) or "none") + '</strong> ('
+                + escape(summary["selection_status"].replace("_", " ")) + '). '
+                'Scores depend on stated weights and same-concentration normalization.</p>')
+    report = json.loads(find_result_file(out, "selection_interpretation.json").read_text())
+    body.append('<details><summary>Selection reasons and trade-offs</summary>'
+                + selection_interpretation_html(report) + '</details>')
+    body.append('<p>Numerical transport checks: ' + str(physics["checks_passed"]) + ' passed; '
+                + str(physics["checks_failed"]) + ' failed; ' + str(physics["checks_not_evaluated"])
+                + ' not evaluated. These checks establish unit consistency, not measured accuracy.</p>')
+    body.append('<details><summary>Uncertainty ranges and valid-draw counts</summary>')
+    for filename, title in [("property_uncertainty_at_reference.csv", "Property uncertainty"),
+                            ("score_uncertainty_at_reference.csv", "Score uncertainty")]:
+        frame = read(filename)[["dopant", "efficiency_mode", "property", "unit", "central_value",
+                                "p05", "p50", "p95", "valid_draws", "total_draws", "valid_draw_fraction"]]
+        body.append(table(filename, title, frame.rename(columns={"dopant": "Dopant", "efficiency_mode": "Efficiency mode",
+            "property": "Property", "unit": "Unit", "central_value": "Central", "p05": "5th percentile",
+            "p50": "Median", "p95": "95th percentile", "valid_draws": "Valid draws", "total_draws": "Total draws",
+            "valid_draw_fraction": "Valid fraction"})))
+    body.append('</details>')
+    body.append(concise_calculation_html(out, inline=inline))
+    body.append('<h2>Sensitivity and figures</h2><p>Weight sensitivity varies preferences; input sensitivity varies '
+                'uncertain inputs at fixed weights. Blue/orange = shared/separate efficiencies; ties split wins, '
+                'invalid trials remain in denominators. Shares are scenario frequencies. Uncertainty plots show medians and '
+                '5–95% ranges of usable draws, with central values separately marked; these are not calibrated confidence intervals.</p>')
+    if not inline:
+        paths = sorted((out / "02_figures").glob("*.png")) if full else [
+            find_result_file(out, name) for name in summary["display_figures"]]
+        for path in paths:
+            pdf = path.with_suffix(".pdf")
+            link = ('<a href="' + escape(pdf.relative_to(out).as_posix(), quote=True) + '">Vector PDF</a>') if pdf.exists() else ""
+            body.append('<section><img loading="lazy" src="' + escape(path.relative_to(out).as_posix(), quote=True)
+                        + '" alt="' + escape(path.stem, quote=True) + '"><p>' + link + '</p></section>')
+        body.append('<p><a href="FULL_REPORT.html">All figures and files</a> · '
+                    '<a href="FILE_INDEX.csv">File index</a> · <a href="COLUMN_GUIDE.csv">Column/unit guide</a></p>')
+        if full:
+            index = read("FILE_INDEX.csv")
+            for folder, part in index.groupby(index.relative_path.str.split("/").str[0], sort=False):
+                body.append('<details><summary>' + escape(folder) + '</summary><ul>')
+                for row in part.itertuples():
+                    body.append('<li><a href="' + escape(row.relative_path, quote=True) + '">'
+                                + escape(Path(row.relative_path).name) + '</a> — ' + escape(row.description) + '</li>')
+                body.append('</ul></details>')
+    return '<style>' + style + '</style><div class="sno-report">' + "\n".join(body) + '</div>'
+
+
+def write_simple_start_page(out):
+    """Write compact views and the complete file/figure index from one renderer."""
+    out = Path(out)
+    fragment = compact_report_html(out, inline=True)
+    pages = {"START_HERE.html": compact_report_html(out),
+             "FULL_REPORT.html": compact_report_html(out, full=True)}
+    # Render every view before writing, so a rendering error cannot replace one
+    # view with incomplete content while leaving another apparently successful.
+    (out / "NOTEBOOK_SUMMARY.html").write_text(fragment, encoding="utf-8")
+    for name, content in pages.items():
+        document = ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+                    '<meta name="viewport" content="width=device-width,initial-scale=1">'
+                    '<title>SnO results</title></head><body style="max-width:1250px;margin:24px auto;'
+                    'padding:0 12px;background:#111827;color:#fff">' + content + '</body></html>')
+        (out / name).write_text(document, encoding="utf-8")
+
+
+def display_inline_results(out, cfg, tables=None):
+    if not cfg["display_results_inline"]: return
+    from IPython.display import display, HTML, Image
+    out=Path(out)
+    display(HTML((out/"NOTEBOOK_SUMMARY.html").read_text(encoding="utf-8")))
+    summary=json.loads(find_result_file(out,"compact_summary.json").read_text())
+    for name in summary["display_figures"]:
+        display(Image(filename=str(find_result_file(out,name))))
+
+
 def main(config=None):
     global RESULT_TABLES
     cfg = deepcopy(CONFIG if config is None else config)
     validate_score_config(cfg)
+    validate_extensions(cfg)
     if cfg["run_size"] == "publication":
         cfg.update(bootstrap_models=max(200, cfg["bootstrap_models"]), mc_draws=max(2000, cfg["mc_draws"]))
     if cfg["bootstrap_models"] < 2 or cfg["mc_draws"] < 2: raise ValueError("At least two resamples are needed.")
@@ -2371,11 +3522,13 @@ def main(config=None):
     write_provenance(out, cfg)
     key = None if cfg["cached_raw_json"] else get_api_key()
     raw = fetch_data(cfg, out, key)
-    data, host, structure = curate(raw, out)
+    print("Progress: Selecting the SnO host and filtering formation-energy training data...")
+    data, host, structure = curate(raw, out, cfg)
     write_dataset_summary(data, raw, out)
     columns = get_feature_columns(data, cfg)
     csv_out(data[["material_id", "formula", "A"]+columns], out / "X_features_and_groups.csv")
     csv_out(data[["material_id", "formation_energy_eV_atom"]], out / "y_target.csv")
+    print("Progress: Training and testing the bulk formation-energy model...")
     model, chosen, reliable, oof, _ = train_gradient_boosting(data, columns, cfg, out)
     print("Testing transfer to each withheld dopant element...")
     transfer = leave_one_element_out(data, columns, cfg, out)
@@ -2393,9 +3546,28 @@ def main(config=None):
     make_figures(screen, pareto, robust, cfg, out)
     make_added_figures(screen, score_details, all_scores, selection, cfg, out)
     plot_selected_tradeoffs(tradeoffs, out)
+    print("Progress: Plotting saved property and score uncertainty samples...")
+    make_uncertainty_figures(screen, score_details, cfg, out)
+    print("Progress: Checking selection sensitivity and making figures...")
+    run_integrated_sensitivity(screen, all_scores, cfg, out)
+    selection_sensitivity_all_dopants(screen, cfg, out)
+    write_clear_counts(data, raw, cfg, out)
+    print("Progress: Plotting all-dopant bulk conductivity and checking transport units...")
+    plot_bulk_conductivity_all_dopants(screen, cfg, out)
+    plot_na_k_conductivity_ratio(screen, cfg, out)
+    write_transport_physics_audit(screen, cfg, out)
+    write_compact_summary(screen, selection, cfg, out)
+    write_calculation_reference(cfg, out)
+    write_extension_notes(out, cfg)
     write_report(data, screen, robust, chosen, reliable, validation, selection, cfg, out)
+    summary_path = out / "run_summary.txt"
+    summary_path.write_text(summary_path.read_text() +
+        f"SnO screening dopants: {', '.join(DOPANTS)}.\n"
+        "Calculation inputs, logic and sources: CALCULATION_REFERENCE.txt.\n",
+        encoding="utf-8")
     export_workflow_source(out)
     organize_reader_package(out, cfg)
+    write_simple_start_page(out)
     import shutil
     archive = shutil.make_archive(str(out), "zip", root_dir=out)
     print("Complete results ZIP:", archive)
@@ -2416,4 +3588,385 @@ def main(config=None):
 
 
 if __name__ == "__main__":
-    RESULT_DIRECTORY, RESULT_ZIP = main()
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default="", help="Optional JSON of CONFIG overrides; never include an API key.")
+    parser.add_argument("--result-manifest", default="", help="Optional path for successful output locations.")
+    args = parser.parse_args()
+    settings = deepcopy(CONFIG)
+    if args.config:
+        overrides = json.loads(Path(args.config).read_text(encoding="utf-8"))
+        if set(overrides)-set(settings):
+            raise ValueError("Unknown CONFIG keys: " + ", ".join(sorted(set(overrides)-set(settings))))
+        for name,value in overrides.items():
+            if isinstance(settings[name],dict):
+                settings[name].update(value)
+            else:
+                settings[name]=value
+    RESULT_DIRECTORY, RESULT_ZIP = main(settings)
+    if args.result_manifest:
+        write_json(Path(args.result_manifest),dict(directory=str(RESULT_DIRECTORY),zip=str(RESULT_ZIP)))
+'''
+
+# ---------------------- SINGLE-CELL LAUNCHER ----------------------
+import csv as _sno_csv
+import hashlib as _sno_hashlib
+import html as _sno_html
+import json as _sno_json
+import os as _sno_os
+import platform as _sno_platform
+import re as _sno_re
+import subprocess as _sno_subprocess
+import sys as _sno_sys
+import tempfile as _sno_tempfile
+import zipfile as _sno_zipfile
+from datetime import datetime as _sno_datetime, timezone as _sno_timezone
+from getpass import getpass as _sno_getpass
+from pathlib import Path as _SnoPath
+
+SNO_BOOTSTRAP_REVISION = "5.2-sno-manuscript-figures-plus-nak-ratio"  # Isolated setup retained; SnO workflow revision 5.0.
+_SNO_VERBOSE = False
+
+
+def _sno_redact(text, secrets=()):
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "[API_KEY_REDACTED]")
+    # Hide credentials in URLs if a configured package index prints one.
+    return _sno_re.sub(r"(https?://)[^/\s:@]+:[^/\s@]+@", r"\1[REDACTED]@", text)
+
+
+def _sno_stream(command, log_path, environment=None, secrets=()):
+    """Always save sanitized stdout/stderr; show compact progress or full logs."""
+    log_path = _SnoPath(log_path)
+    with log_path.open("w", encoding="utf-8") as log:
+        try:
+            process = _sno_subprocess.Popen(
+                command, stdout=_sno_subprocess.PIPE, stderr=_sno_subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+                env=environment,
+            )
+        except OSError as exc:
+            log.write(_sno_redact(str(exc), secrets))
+            raise RuntimeError(f"Could not start subprocess. See {log_path}.") from None
+        try:
+            for line in process.stdout:
+                safe = _sno_redact(line, secrets)
+                if _SNO_VERBOSE or (log_path.name == "workflow.log" and safe.startswith("Progress:")):
+                    print(safe, end="", flush=True)
+                log.write(safe)
+                log.flush()
+            code = process.wait()
+        except BaseException:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except _sno_subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            raise
+        finally:
+            process.stdout.close()
+    if code != 0:
+        print("\n--- LAST LINES OF THE ACTUAL ERROR ---", flush=True)
+        print("".join(log_path.read_text(encoding="utf-8").splitlines(True)[-60:]))
+        raise RuntimeError(
+            f"Step failed (exit {code}). Full diagnostic log: {log_path}. "
+            "Read the ERROR/Traceback above; the exit code alone is not the cause."
+        ) from None
+
+
+def _sno_child_environment():
+    env = _sno_os.environ.copy()
+    # Do not inherit notebook import paths or pre-existing material API secrets
+    # into package installation. The entered key is added ONLY to the workflow.
+    for name in ("PYTHONPATH", "PYTHONHOME", "MP_API_KEY", "PMG_MAPI_KEY",
+                 "PIP_TARGET", "PIP_PREFIX", "PIP_USER"):
+        env.pop(name, None)
+    env.update(PYTHONUNBUFFERED="1", PYTHONNOUSERSITE="1",
+               MPLBACKEND="Agg", OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1",
+               MKL_NUM_THREADS="1", NUMEXPR_NUM_THREADS="1")
+    return env
+
+
+def _sno_create_and_seed_environment(fresh, diagnostics, environment):
+    """Create a pip-less venv and seed pip WITHOUT invoking ensurepip.
+
+    Main route: existing notebook pip manages the target via --python.
+    If notebook pip is missing/too old, PyPA's official get-pip.py is run
+    by the TARGET interpreter. Neither route installs into system Python.
+    """
+    fresh = _SnoPath(fresh)
+    diagnostics = _SnoPath(diagnostics)
+    interpreter = fresh / "bin" / "python"
+    if _SNO_VERBOSE: print("Creating environment without pip (ensurepip is not used).", flush=True)
+    _sno_stream([_sno_sys.executable, "-m", "venv", "--without-pip", str(fresh)],
+                diagnostics / "environment_creation.log", environment)
+    # Prove the executable is inside an isolated virtual environment before
+    # letting any installer write packages. Never resolve the python symlink
+    # and then use its resolved base-interpreter path to install packages.
+    isolated_probe = (
+        "import sys,site,pathlib; expected=pathlib.Path(sys.argv[1]).resolve(); "
+        "assert pathlib.Path(sys.prefix).resolve()==expected, 'Wrong target prefix'; "
+        "assert sys.prefix != sys.base_prefix, 'Target is not a virtual environment'; "
+        "cfg=(expected/'pyvenv.cfg').read_text().lower(); "
+        "assert 'include-system-site-packages = false' in cfg, 'System packages are exposed'; "
+        "assert not site.ENABLE_USER_SITE, 'User site-packages are exposed'; "
+        "print('Isolated target verified:',sys.prefix)"
+    )
+    _sno_stream([str(interpreter), "-c", isolated_probe, str(fresh)],
+                diagnostics / "environment_isolation.log", environment)
+    host = _sno_subprocess.run(
+        [_sno_sys.executable, "-m", "pip", "--help"], env=environment,
+        stdout=_sno_subprocess.PIPE, stderr=_sno_subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace", timeout=60,
+    )
+    (diagnostics / "host_pip_probe.log").write_text(_sno_redact(host.stdout), encoding="utf-8")
+    install_flags = ["--disable-pip-version-check", "--progress-bar", "off",
+                     "--timeout", "60", "--retries", "3"]
+    if host.returncode == 0 and "--python" in host.stdout:
+        method = "existing_notebook_pip_with_explicit_target_python"
+        if _SNO_VERBOSE: print("Seeding pip into the isolated environment using pip --python.", flush=True)
+        # --python is a pip GLOBAL option, so it must appear BEFORE install.
+        _sno_stream([_sno_sys.executable, "-m", "pip", "--python", str(interpreter),
+                     "install", "--upgrade", *install_flags, "pip", "setuptools", "wheel"],
+                    diagnostics / "pip_bootstrap.log", environment)
+    else:
+        method = "official_PyPA_get_pip_executed_by_target_python"
+        if _SNO_VERBOSE: print("Notebook pip is unavailable or lacks --python; using PyPA's official bootstrap.", flush=True)
+        bootstrap = diagnostics / "get-pip.py"
+        download = (
+            "import urllib.request,urllib.parse,pathlib,hashlib,sys; "
+            "url='https://bootstrap.pypa.io/get-pip.py'; "
+            "request=urllib.request.Request(url,headers={'User-Agent':'SnO-Colab-bootstrap/2'}); "
+            "response=urllib.request.urlopen(request,timeout=60); "
+            "endpoint=urllib.parse.urlparse(response.geturl()); "
+            "assert endpoint.scheme=='https' and endpoint.hostname=='bootstrap.pypa.io', "
+            "'Unexpected bootstrap download origin'; "
+            "data=response.read(8*1024*1024+1); response.close(); "
+            "assert 10000<len(data)<=8*1024*1024, 'Unexpected bootstrap size'; "
+            "compile(data.decode('utf-8'), 'get-pip.py', 'exec'); "
+            "pathlib.Path(sys.argv[1]).write_bytes(data); "
+            "print('Downloaded official PyPA bootstrap; SHA256:',hashlib.sha256(data).hexdigest())"
+        )
+        _sno_stream([str(interpreter), "-c", download, str(bootstrap)],
+                    diagnostics / "bootstrap_download.log", environment)
+        _sno_stream([str(interpreter), str(bootstrap), *install_flags,
+                     "pip", "setuptools", "wheel"], diagnostics / "pip_bootstrap.log", environment)
+    (diagnostics / "bootstrap_method.txt").write_text(method + "\n", encoding="utf-8")
+    pip_probe = (
+        "import sys,pathlib,pip; "
+        "assert pathlib.Path(pip.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix).resolve()), "
+        "'pip was not installed inside the target environment'; "
+        "print('Target pip:',pip.__version__); print('Target pip location:',pip.__file__)"
+    )
+    _sno_stream([str(interpreter), "-c", pip_probe],
+                diagnostics / "pip_location.log", environment)
+    return interpreter
+
+
+def _sno_install(project, diagnostics):
+    """Reuse only a validated matching environment; never reuse partial installs."""
+    if _sno_sys.version_info[:2] not in ((3, 12), (3, 13)):
+        raise RuntimeError(
+            f"This runner supports Python 3.12/3.13; this kernel is {_sno_platform.python_version()}. "
+            "Use a compatible Colab runtime; do not force-install incompatible wheels."
+        )
+    env = _sno_child_environment()
+    identity = (SNO_BOOTSTRAP_REVISION + _sno_sys.version + _sno_sys.executable + SNO_REQUIREMENTS).encode()
+    digest = _sno_hashlib.sha256(identity).hexdigest()[:16]
+    env_root = project / "environments"
+    env_root.mkdir(parents=True, exist_ok=True)
+    marker = env_root / f"ready_{digest}.json"
+    interpreter = None
+    if marker.exists():
+        try:
+            saved = _sno_json.loads(marker.read_text(encoding="utf-8"))
+            candidate = _SnoPath(saved["python"])
+            if candidate.parent.parent.parent.resolve() == env_root.resolve() and candidate.is_file():
+                interpreter = candidate
+        except (ValueError, KeyError, OSError):
+            pass
+    probe = (
+        "import sys, importlib.metadata as m; "
+        "import numpy,pandas,scipy,sklearn,matplotlib,joblib; "
+        "from mp_api.client import MPRester; "
+        "from pymatgen.core import Structure; "
+        "from pymatgen.analysis.local_env import CrystalNN; "
+        "from pymatgen.analysis.dimensionality import get_structure_components; "
+        "from pymatgen.io.vasp import Poscar; "
+        "print('Python:',sys.version); "
+        "print('Required imports: PASS'); "
+        "print({p:m.version(p) for p in "
+        "['numpy','scipy','pandas','scikit-learn','mp-api','pymatgen','pymatgen-core']})"
+    )
+    if interpreter is not None:
+        if _SNO_VERBOSE: print("Checking the previously successful isolated environment...", flush=True)
+        try:
+            _sno_stream([str(interpreter), "-m", "pip", "check"],
+                        diagnostics / "pip_check.log", env)
+            _sno_stream([str(interpreter), "-c", probe],
+                        diagnostics / "imports.log", env)
+        except RuntimeError:
+            print("Prior environment failed validation; creating a new one. Old files are preserved.")
+            interpreter = None
+    if interpreter is None:
+        fresh = _SnoPath(_sno_tempfile.mkdtemp(prefix="python_", dir=env_root))
+        if _SNO_VERBOSE: print("Creating clean isolated environment:", fresh, flush=True)
+        interpreter = _sno_create_and_seed_environment(fresh, diagnostics, env)
+        requirements = diagnostics / "requirements-requested.txt"
+        requirements.write_text(SNO_REQUIREMENTS, encoding="utf-8")
+        _sno_stream([str(interpreter), "-m", "pip", "install",
+                     "--disable-pip-version-check", "--progress-bar", "off",
+                     "--prefer-binary", "--timeout", "60", "--retries", "3",
+                     "--report", str(diagnostics / "pip-install-report.json"),
+                     "-r", str(requirements)], diagnostics / "installation.log", env)
+        _sno_stream([str(interpreter), "-m", "pip", "check"],
+                    diagnostics / "pip_check.log", env)
+        _sno_stream([str(interpreter), "-c", probe],
+                    diagnostics / "imports.log", env)
+        marker.write_text(_sno_json.dumps({"python": str(interpreter), "signature": digest}),
+                          encoding="utf-8")
+    (diagnostics / "requirements-requested.txt").write_text(SNO_REQUIREMENTS, encoding="utf-8")
+    _sno_stream([str(interpreter), "-m", "pip", "freeze"],
+                diagnostics / "requirements-resolved.txt", env)
+    return str(interpreter)
+
+
+def _sno_download(path):
+    print("File ready:", path, flush=True)
+    try:
+        from google.colab import files
+        files.download(str(path))
+    except Exception as exc:
+        print(f"Automatic download unavailable ({type(exc).__name__}). "
+              "In Colab, use the left Files panel to download the file manually.")
+
+
+def _sno_diagnostics_zip(diagnostics):
+    # Allowlist text artifacts; never package environment variables or API keys.
+    archive = diagnostics.parent / (diagnostics.name + ".zip")
+    with _sno_zipfile.ZipFile(archive, "w", _sno_zipfile.ZIP_DEFLATED) as zipped:
+        for path in sorted(diagnostics.iterdir()):
+            if path.is_file() and path.suffix in (".txt", ".log"):
+                zipped.write(path, arcname=path.name)
+    return archive
+
+
+def _sno_display_results(directory):
+    # Rendering requires only standard-library modules and IPython in the parent.
+    try:
+        from IPython.display import display, HTML, Image
+        def find(name):
+            matches=list(directory.rglob(name))
+            if len(matches)!=1: raise ValueError(f"Expected one {name}; found {len(matches)}")
+            return matches[0]
+        display(HTML(find("NOTEBOOK_SUMMARY.html").read_text(encoding="utf-8")))
+        summary=_sno_json.loads(find("compact_summary.json").read_text(encoding="utf-8"))
+        for name in summary["display_figures"]:
+            display(Image(filename=str(find(name))))
+    except Exception as exc:
+        print(f"Display skipped ({type(exc).__name__}: {exc}). Open START_HERE.html in the results ZIP.")
+
+
+def run_sno_one_cell(options=None, settings=None):
+    global _SNO_VERBOSE
+    options = dict(SNO_OPTIONS if options is None else options)
+    _SNO_VERBOSE = bool(options.get("verbose_logs", False))
+    settings = dict(SNO_SETTINGS if settings is None else settings)
+    if any("key" in name.lower() for name in settings):
+        raise ValueError("Never store an API key in settings; use the hidden prompt.")
+    project = _SnoPath(options["project_directory"]).expanduser().resolve()
+    project.mkdir(parents=True, exist_ok=True)
+    timestamp = _sno_datetime.now(_sno_timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    diagnostics = project / f"diagnostics_{timestamp}"
+    diagnostics.mkdir(exist_ok=False)
+    diagnostic_info = {
+        "bootstrap_revision": SNO_BOOTSTRAP_REVISION,
+        "python_version": _sno_sys.version,
+        "python_executable": _sno_sys.executable,
+        "platform": _sno_platform.platform(),
+        "machine": _sno_platform.machine(),
+        "workflow_sha256": _sno_hashlib.sha256(SNO_WORKFLOW_SOURCE.encode()).hexdigest(),
+    }
+    (diagnostics / "runtime.txt").write_text(_sno_json.dumps(diagnostic_info, indent=2), encoding="utf-8")
+    print("SnO v5.0 — conductivity, dopant selection and uncertainty — Python",
+          _sno_platform.python_version(), flush=True)
+    if _SNO_VERBOSE: print("Diagnostic folder:", diagnostics, flush=True)
+    print("Stage 1/4: installation and import checks.", flush=True)
+    key = ""
+    child_env = None
+    try:
+        interpreter = _sno_install(project, diagnostics)
+        source = diagnostics / "sno_integrated_workflow.py"
+        compile(SNO_WORKFLOW_SOURCE, str(source), "exec")
+        source.write_text(SNO_WORKFLOW_SOURCE, encoding="utf-8")
+        # Full module import catches failures not covered by individual probes.
+        _sno_stream([interpreter, "-c",
+                     "import runpy,sys; runpy.run_path(sys.argv[1],run_name='sno_import_check'); "
+                     "print('Full workflow import: PASS')", str(source)],
+                    diagnostics / "workflow_import.log", _sno_child_environment())
+        if options.get("setup_only"):
+            print("SETUP PASSED. Set setup_only=False and run the same cell again for real MP data.")
+            print("The validated environment will be reused; no key was requested.")
+            return {"setup_only": True, "python": interpreter, "diagnostics": str(diagnostics)}
+        settings["output_parent"] = str(project)
+        settings["display_results_inline"] = False
+        settings["auto_download_zip_in_colab"] = False
+        config = diagnostics / "settings.json"
+        config.write_text(_sno_json.dumps(settings, indent=2), encoding="utf-8")
+        manifest = diagnostics / "successful_run.json"  # unique; cannot use an old successful ZIP
+        child_env = _sno_child_environment()
+        if not settings.get("cached_raw_json"):
+            print("Stage 2/4: enter your Materials Project API key in the hidden prompt.", flush=True)
+            key = _sno_getpass("Materials Project API key (hidden; never saved): ").strip()
+            if not key:
+                raise ValueError("An API key is required for a fresh MP download.")
+            child_env["MP_API_KEY"] = key
+        else:
+            print("Stage 2/4: using your specified raw-data cache (no API key needed).", flush=True)
+        print("Stage 3/4: data, ML, SnO transport, uncertainty and sensitivity.", flush=True)
+        try:
+            _sno_stream([interpreter, "-u", str(source), "--config", str(config),
+                         "--result-manifest", str(manifest)], diagnostics / "workflow.log",
+                        child_env, secrets=(key,))
+        finally:
+            child_env.pop("MP_API_KEY", None)
+            key = ""
+        location = _sno_json.loads(manifest.read_text(encoding="utf-8"))
+        result_directory = _SnoPath(location["directory"])
+        result_zip = _SnoPath(location["zip"])
+        if not result_directory.is_dir() or not result_zip.is_file():
+            raise RuntimeError("Workflow reported success but its output files are missing.")
+        # Include resolved dependencies and sanitized logs for reproducibility.
+        # pip's raw JSON install report is deliberately NOT bundled (index URLs).
+        with _sno_zipfile.ZipFile(result_zip, "a", _sno_zipfile.ZIP_DEFLATED) as zipped:
+            for path in sorted(diagnostics.iterdir()):
+                if path.is_file() and path.suffix in (".txt", ".log"):
+                    zipped.write(path, arcname="00_execution_diagnostics/" + path.name)
+        print("Stage 4/4: completed. Results:", result_zip, flush=True)
+        if options.get("display_results", True):
+            _sno_display_results(result_directory)
+        if options.get("download_results", True):
+            _sno_download(result_zip)
+        return {"directory": str(result_directory), "zip": str(result_zip),
+                "python": interpreter, "diagnostics": str(diagnostics)}
+    except Exception as exc:
+        safe_error = _sno_redact(f"{type(exc).__name__}: {exc}", (key,))
+        (diagnostics / "failure.txt").write_text(safe_error, encoding="utf-8")
+        print("\nSTOPPED:", safe_error, flush=True)
+        print("No previous result is being presented as a successful new run.")
+        archive = _sno_diagnostics_zip(diagnostics)
+        print("If you need help, attach this diagnostic ZIP (not your API key):", archive)
+        if options.get("download_results", True):
+            _sno_download(archive)
+        raise RuntimeError(safe_error) from None
+    finally:
+        key = ""
+        if child_env is not None:
+            child_env.pop("MP_API_KEY", None)
+
+
+# In Colab the cell is __main__. When imported for offline tests, it does not run.
+if __name__ == "__main__":
+    SNO_LAST_RUN = run_sno_one_cell()
