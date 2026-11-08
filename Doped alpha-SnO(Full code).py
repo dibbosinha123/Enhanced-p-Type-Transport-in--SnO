@@ -1,10 +1,11 @@
 # SnO: ONE-CELL COLAB RUNNER — conductivity, dopant selection and uncertainty, v5.0
 # Paste this ENTIRE file into ONE code cell in a fresh Google Colab notebook.
-# The full workflow and isolated package setup are included; an MP key is requested privately.
+# The full workflow and isolated package setup are included; the API key below is used automatically.
 # Li, Na, K, N and P are retained. All charts are calculated from the current run.
 # ML predicts compound formation energy. Conductivity uses the existing physical scenario model.
 
 # ------------------------- USER SETTINGS -------------------------
+API_KEY = '4QoUiunPSMRpqOLTwA6qRu8edPSBArZD'  # Materials Project API key; no runtime prompt.
 SNO_OPTIONS = {
     "project_directory": "/content/SnO_OneCell_v5",
     "verbose_logs": False,
@@ -83,7 +84,6 @@ from pathlib import Path
 from datetime import datetime, timezone
 from functools import lru_cache
 from copy import deepcopy
-from getpass import getpass
 
 
 def ensure_dependencies():
@@ -135,7 +135,7 @@ from mp_api.client import MPRester
 
 
 # ------------------------- EDITABLE CONFIGURATION -------------------------
-API_KEY = ""  # Prefer hidden prompt or MP_API_KEY environment variable.
+API_KEY = "4QoUiunPSMRpqOLTwA6qRu8edPSBArZD"  
 
 CONFIG = {
     "seed": 42,
@@ -300,15 +300,7 @@ def csv_out(frame, path):
 def get_api_key():
     key = API_KEY.strip() or os.environ.get("MP_API_KEY") or os.environ.get("PMG_MAPI_KEY")
     if not key:
-        try:
-            from google.colab import userdata
-            key = userdata.get("MP_API_KEY")
-        except Exception:
-            pass
-    if not key:
-        key = getpass("Materials Project API key (hidden): ").strip()
-    if not key:
-        raise ValueError("A Materials Project API key or a saved raw-data JSON is required.")
+        raise ValueError("Set API_KEY in the code or specify a saved raw-data JSON.")
     return key
 
 
@@ -3621,7 +3613,6 @@ import sys as _sno_sys
 import tempfile as _sno_tempfile
 import zipfile as _sno_zipfile
 from datetime import datetime as _sno_datetime, timezone as _sno_timezone
-from getpass import getpass as _sno_getpass
 from pathlib import Path as _SnoPath
 
 SNO_BOOTSTRAP_REVISION = "5.2-sno-manuscript-figures-plus-nak-ratio"  # Isolated setup retained; SnO workflow revision 5.0.
@@ -3679,7 +3670,7 @@ def _sno_stream(command, log_path, environment=None, secrets=()):
 def _sno_child_environment():
     env = _sno_os.environ.copy()
     # Do not inherit notebook import paths or pre-existing material API secrets
-    # into package installation. The entered key is added ONLY to the workflow.
+    # into package installation. The configured key is added ONLY to the workflow.
     for name in ("PYTHONPATH", "PYTHONHOME", "MP_API_KEY", "PMG_MAPI_KEY",
                  "PIP_TARGET", "PIP_PREFIX", "PIP_USER"):
         env.pop(name, None)
@@ -3875,7 +3866,7 @@ def run_sno_one_cell(options=None, settings=None):
     _SNO_VERBOSE = bool(options.get("verbose_logs", False))
     settings = dict(SNO_SETTINGS if settings is None else settings)
     if any("key" in name.lower() for name in settings):
-        raise ValueError("Never store an API key in settings; use the hidden prompt.")
+        raise ValueError("Store the API key in API_KEY, not in settings.")
     project = _SnoPath(options["project_directory"]).expanduser().resolve()
     project.mkdir(parents=True, exist_ok=True)
     timestamp = _sno_datetime.now(_sno_timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
@@ -3918,10 +3909,10 @@ def run_sno_one_cell(options=None, settings=None):
         manifest = diagnostics / "successful_run.json"  # unique; cannot use an old successful ZIP
         child_env = _sno_child_environment()
         if not settings.get("cached_raw_json"):
-            print("Stage 2/4: enter your Materials Project API key in the hidden prompt.", flush=True)
-            key = _sno_getpass("Materials Project API key (hidden; never saved): ").strip()
+            print("Stage 2/4: using the Materials Project API key configured in the code.", flush=True)
+            key = API_KEY.strip()
             if not key:
-                raise ValueError("An API key is required for a fresh MP download.")
+                raise ValueError("Set API_KEY near the top of the code before downloading MP data.")
             child_env["MP_API_KEY"] = key
         else:
             print("Stage 2/4: using your specified raw-data cache (no API key needed).", flush=True)
